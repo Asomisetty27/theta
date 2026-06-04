@@ -23,6 +23,8 @@ from rich.console import Console
 from rich.table import Table
 from rich import box
 
+from . import __version__
+
 app     = typer.Typer(
     name="thermalos",
     add_completion=False,
@@ -30,6 +32,28 @@ app     = typer.Typer(
     help="GPU thermal-power forensics. Run [bold green]thermalos setup[/] to get started.",
 )
 console = Console()
+
+
+# ── Saved-config helpers ──────────────────────────────────────────────────────
+
+_CONFIG_PATH = Path.home() / ".thermalos" / "config.json"
+
+
+def _saved_config() -> dict:
+    """Load the wizard-saved config if present, else return an empty dict."""
+    if not _CONFIG_PATH.exists():
+        return {}
+    try:
+        return json.loads(_CONFIG_PATH.read_text())
+    except (json.JSONDecodeError, OSError):
+        return {}
+
+
+def _coalesce(cli_value, config_key: str, saved: dict, default):
+    """CLI value (if set) > saved config > default. Treat sentinels as 'unset'."""
+    if cli_value is not None and cli_value != "__default__":
+        return cli_value
+    return saved.get(config_key, default)
 
 
 # ── setup ─────────────────────────────────────────────────────────────────────
@@ -45,38 +69,54 @@ def setup():
 
 @app.command()
 def monitor(
-    interval:    float = typer.Option(5.0,    "--interval",    "-i",   help="Sample interval (seconds)"),
-    gpus:        str   = typer.Option("all",  "--gpus",        "-g",   help="GPU indices (comma-sep) or 'all'"),
-    webhook:     Optional[str] = typer.Option(None, "--webhook", "-w", help="Alert webhook URL (Slack/generic)"),
-    log_file:    Optional[str] = typer.Option(None, "--log",           help="JSONL alert log file"),
-    port:        int   = typer.Option(9101,   "--port",        "-p",   help="Prometheus port (0 = disabled)"),
-    quiet:       bool  = typer.Option(False,  "--quiet",       "-q",   help="Suppress stdout alerts"),
-    dt:          bool  = typer.Option(True,   "--dt/--nb",             help="Use Decision Tree (--dt) or Naive Bayes (--nb)"),
-    sigma_warn:  float = typer.Option(2.0,    "--sigma-warn",          help="Drift warning threshold (σ)"),
-    sigma_crit:  float = typer.Option(3.5,    "--sigma-crit",          help="Drift critical threshold (σ)"),
+    interval:    Optional[float] = typer.Option(None, "--interval",   "-i",  help="Sample interval seconds [default: 5.0 or saved config]"),
+    gpus:        Optional[str]   = typer.Option(None, "--gpus",       "-g",  help="GPU indices (comma-sep) or 'all' [default: saved config or all]"),
+    webhook:     Optional[str]   = typer.Option(None, "--webhook",    "-w",  help="Alert webhook URL [default: saved config or none]"),
+    log_file:    Optional[str]   = typer.Option(None, "--log",                help="JSONL alert log file [default: saved config or none]"),
+    port:        Optional[int]   = typer.Option(None, "--port",       "-p",  help="Prometheus port; 0 disables [default: saved config or 9101]"),
+    quiet:       bool            = typer.Option(False, "--quiet",     "-q",  help="Suppress stdout alerts"),
+    dt:          bool            = typer.Option(True,  "--dt/--nb",          help="Use Decision Tree (--dt) or Naive Bayes (--nb)"),
+    sigma_warn:  float           = typer.Option(2.0,   "--sigma-warn",       help="Drift warning threshold (σ)"),
+    sigma_crit:  float           = typer.Option(3.5,   "--sigma-crit",       help="Drift critical threshold (σ)"),
 ):
-    """Run the ThermalOS monitoring agent."""
+    """Run the ThermalOS monitoring agent. Reads ~/.thermalos/config.json if present (CLI flags override)."""
     from .agent.daemon import ThermalOSAgent, AgentConfig
 
-    gpu_list = None if gpus == "all" else [int(g) for g in gpus.split(",")]
+    saved = _saved_config()
+
+    # Resolve each field: explicit CLI flag > saved config > hardcoded default
+    interval_v   = interval if interval is not None else saved.get("interval_sec", 5.0)
+    gpus_v       = gpus     if gpus     is not None else (
+        ",".join(str(i) for i in saved["gpu_indices"]) if saved.get("gpu_indices") else "all"
+    )
+    webhook_v    = webhook  if webhook  is not None else saved.get("webhook_url")
+    log_file_v   = log_file if log_file is not None else saved.get("alert_log_path")
+    port_v       = port     if port     is not None else (
+        saved.get("prometheus_port", 9101) if saved.get("enable_prometheus", True) else 0
+    )
+
+    gpu_list = None if gpus_v == "all" else [int(g) for g in gpus_v.split(",")]
 
     cfg = AgentConfig(
-        interval_sec      = interval,
+        interval_sec      = interval_v,
         gpu_indices       = gpu_list,
-        webhook_url       = webhook,
-        alert_log_path    = log_file,
-        prometheus_port   = port,
-        enable_prometheus = port > 0,
+        webhook_url       = webhook_v,
+        alert_log_path    = log_file_v,
+        prometheus_port   = port_v,
+        enable_prometheus = port_v > 0,
         quiet             = quiet,
         prefer_dt         = dt,
         k_warn            = sigma_warn,
         k_critical        = sigma_crit,
     )
 
+    # rebind so the banner below uses resolved values
+    interval, port = interval_v, port_v
+
     agent = ThermalOSAgent(cfg)
 
     console.print(
-        f"[bold green]ThermalOS v0.1.0[/bold green]  "
+        f"[bold green]ThermalOS v{__version__}[/bold green]  "
         f"[dim]interval={interval}s  classifier={agent._classifier.mode}  "
         f"{'prometheus:' + str(port) if port > 0 else 'no-metrics'}[/dim]"
     )
@@ -144,7 +184,7 @@ def classify(
     from .agent.metrics   import enrich
     from .agent.window    import SteadyStateWindow
     from .agent.classifier import StateClassifier
-    from .metrics          import STATE_LABELS
+    from .agent.metrics    import STATE_LABELS  # noqa: F401  (used in _print_classify_table)
 
     gpu_list = None if gpus == "all" else [int(g) for g in gpus.split(",")]
 
@@ -227,8 +267,12 @@ def train(
     csv: str = typer.Argument(..., help="Path to ThermalOS_Measurements_Raw.csv"),
 ):
     """Retrain bundled classifier models from Stage 1 CSV data."""
+    csv_path = Path(csv)
+    if not csv_path.exists():
+        console.print(f"[red]Error:[/red] CSV not found: {csv}")
+        raise typer.Exit(code=1)
     from .models.train import train as do_train
-    do_train(Path(csv))
+    do_train(csv_path)
 
 
 # ── serve ─────────────────────────────────────────────────────────────────────

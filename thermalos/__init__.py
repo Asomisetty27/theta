@@ -1,2 +1,7 @@
 """ThermalOS — GPU thermal-power forensics agent."""
-__version__ = "0.1.0"
+from importlib.metadata import PackageNotFoundError, version as _v
+
+try:
+    __version__ = _v("thermalos")
+except PackageNotFoundError:
+    __version__ = "0.0.0+unknown"

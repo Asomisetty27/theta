@@ -31,6 +31,8 @@ from rich.table import Table
 from rich.text import Text
 from rich import box
 
+from . import __version__
+
 CONFIG_PATH = Path.home() / ".thermalos" / "config.json"
 console = Console()
 
@@ -92,7 +94,7 @@ def step_welcome() -> None:
         align="center",
     ))
     console.print(Align(
-        f"[{TEXT}]GPU thermal-power forensics.  [{DIM}]v0.1.0 · MIT licensed[/]",
+        f"[{TEXT}]GPU thermal-power forensics.  [{DIM}]v{__version__} · MIT licensed[/]",
         align="center",
     ))
     console.print()
@@ -427,7 +429,7 @@ def step_first_reading(gpus: list[dict], baselines: dict) -> None:
                         continue
                     window = win.update(
                         s.gpu_index, s.timestamp,
-                        enriched.rtheta, s.raw.power_w, s.raw.util_pct, s.raw.perf_state
+                        enriched.rtheta, s.power_w, s.util_pct, s.perf_state
                     )
                     coverage = int(win.coverage(s.gpu_index, s.timestamp) * 10)
                     prog.update(tasks.get(s.gpu_index, list(tasks.values())[0]), completed=coverage)
@@ -530,7 +532,7 @@ def step_finish(sys_info: dict, gpus: list[dict], baselines: dict, alert_cfg: di
     step_header(6, 6, "All set", "Config saved — ready to monitor")
 
     config = {
-        "version":        "0.1.0",
+        "version":        __version__,
         "interval_sec":   5.0,
         "gpu_indices":    [g["index"] for g in gpus],
         "baselines":      {str(k): v for k, v in baselines.items()},

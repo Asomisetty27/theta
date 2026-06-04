@@ -23,6 +23,7 @@ from typing import Optional
 from .metrics import AlertEvent, EnrichedSample, GPUState, STATE_LABELS
 from .window import WindowResult
 from .detector import DriftResult
+from .. import __version__
 
 log = logging.getLogger(__name__)
 
@@ -86,7 +87,7 @@ class PrometheusExporter:
         # Build info
         try:
             self.i_build = Info("thermalos_build", "ThermalOS agent build info")
-            self.i_build.info({"version": "0.1.0", "stage1_rows": "4570"})
+            self.i_build.info({"version": __version__, "stage1_rows": "5987"})
         except Exception:
             pass
 

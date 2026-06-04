@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Optional
 
 from .metrics import AlertEvent, GPUState, STATE_LABELS
+from .. import __version__
 
 log = logging.getLogger(__name__)
 
@@ -127,7 +128,7 @@ class WebhookAlerter(BaseAlerter):
 
         return {
             "source":           "thermalos",
-            "version":          "0.1.0",
+            "version":          __version__,
             "timestamp":        ts,
             "severity":         sev,
             "gpu_index":        event.gpu_index,
@@ -173,6 +174,7 @@ class FileAlerter(BaseAlerter):
 
     async def send(self, event: AlertEvent) -> None:
         record = {
+            "version":   __version__,
             "ts":        event.timestamp,
             "gpu":       event.gpu_index,
             "severity":  _severity(event),
