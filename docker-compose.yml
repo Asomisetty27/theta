@@ -1,0 +1,64 @@
+services:
+
+  # ── ThermalOS agent ──────────────────────────────────────────────────────────
+  thermalos:
+    build: .
+    image: thermalos/agent:latest
+    restart: unless-stopped
+    # GPU passthrough — requires nvidia-container-toolkit on the host.
+    # Remove the `deploy` block if running without a GPU (demo mode kicks in).
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    ports:
+      - "9101:9101"     # Prometheus metrics
+    volumes:
+      - thermalos-config:/home/thermalos/.thermalos
+      - thermalos-logs:/var/log/thermalos
+    environment:
+      THERMALOS_INTERVAL: "5"
+    healthcheck:
+      test: ["CMD", "thermalos", "--help"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ── Prometheus (optional — enable with: docker compose --profile metrics up) ─
+  prometheus:
+    profiles: [metrics]
+    image: prom/prometheus:latest
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./deploy/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=30d
+
+  # ── Grafana (optional — enable with: docker compose --profile metrics up) ────
+  grafana:
+    profiles: [metrics]
+    image: grafana/grafana:latest
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./deploy/grafana/provisioning:/etc/grafana/provisioning:ro
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: "thermalos"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    depends_on:
+      - prometheus
+
+volumes:
+  thermalos-config:
+  thermalos-logs:
+  prometheus-data:
+  grafana-data:
