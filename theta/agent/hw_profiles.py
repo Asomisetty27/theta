@@ -81,6 +81,21 @@ class ThermalProfile:
     #   "datasheet":    inferred from vendor datasheets only (not validated)
     confidence: str  # "measured" | "extrapolated" | "datasheet"
 
+    # T_ref reference temperature strategy.
+    #   "idle_window":    lock T_ref from stable GPU idle periods (default, air-cooled)
+    #   "coolant_inlet":  use BMC coolant-inlet temperature or profile.expected_ambient_c
+    #                     as T_ref. Idle junction on liquid-cooled hardware is too close to
+    #                     coolant temperature to be a useful reference — the ΔT at idle falls
+    #                     below MIN_DELTA_T (0.5 °C), making idle R_theta invalid. The coolant
+    #                     inlet is the physically correct reference for these GPUs.
+    t_ref_strategy: str = "idle_window"   # "idle_window" | "coolant_inlet"
+
+    # Minimum std floor for the drift detector rolling baseline.
+    # Must scale with the R_theta operating range. T4 (air): 0.010 C/W.
+    # Liquid-cooled hardware has R_theta ~10× smaller — use a smaller floor so
+    # the detector isn't swamped by the noise floor when the signal is 0.014 C/W.
+    drift_min_std: float = 0.010
+
     # Notes for operators
     notes: tuple[str, ...] = field(default_factory=tuple)
 
@@ -172,23 +187,43 @@ _PROFILES: dict[str, ThermalProfile] = {
         idle_floor_w=70.0,
         junction_max_c=95.0,
         expected_ambient_c=20.0,  # liquid-cooled DGX H100 typically runs 18-22 °C
-        # H100 SXM5 is liquid-cooled cold-plate → much lower R_theta than air-cooled
-        rtheta_load_threshold=0.40,
-        rtheta_idle_threshold=0.72,
-        rtheta_expected_under_load=0.30,
-        rtheta_expected_idle=0.62,
-        rtheta_drift_warn_c_per_day=0.0006,  # liquid cooling is slower to drift
-        rtheta_drift_crit_c_per_day=0.003,
+        # H100 SXM5 is liquid-cooled cold-plate → R_theta lower and constant.
+        # With 20 °C coolant, R_theta ≈ 0.075 C/W across idle/load.
+        # Degradation threshold at +20%: ~0.090 C/W.
+        rtheta_load_threshold=0.090,
+        rtheta_idle_threshold=0.090,   # equal to load — no idle/load gap in liquid cooling
+        rtheta_expected_under_load=0.075,
+        rtheta_expected_idle=0.075,    # same as load for liquid cooling
+        rtheta_drift_warn_c_per_day=0.0005,
+        rtheta_drift_crit_c_per_day=0.002,
         cooling="liquid-cold-plate",
+        t_ref_strategy="coolant_inlet",
+        drift_min_std=0.003,
         confidence="extrapolated",
         notes=(
-            "Liquid-cooled cold-plate dominates thermal path; ambient less relevant.",
-            "Use BMC inlet temp from Redfish as T_ref override when available.",
+            "Liquid-cooled cold-plate; T_ref must be coolant-inlet (BMC Redfish).",
+            "R_theta constant across load — classification relies on P-state + power.",
             "HBM3 stacks have separate thermal path — monitor independently if exposed.",
         ),
     ),
 
-    # ── NVIDIA — B200 SXM6 (Blackwell, dual-die CoWoS-L) ──
+    # ── NVIDIA — B200 SXM6 (Blackwell, dual-die CoWoS-L, liquid cold-plate) ──
+    #
+    # Physics basis (liquid cold-plate, 20 °C coolant, T_ref = coolant inlet):
+    #   R_thermal_junction_to_coolant ≈ 0.060 C/W  (effective, both dies combined)
+    #   P_idle ≈ 88 W  → T_j_idle ≈ 20 + 0.060 * 88  ≈ 25 °C
+    #   P_load ≈ 900 W → T_j_load ≈ 20 + 0.060 * 900 ≈ 74 °C
+    #   → R_theta(idle) ≈ R_theta(load) ≈ 0.060 C/W  (constant for liquid cooling!)
+    #
+    # IMPORTANT: unlike air-cooled GPUs, liquid-cooled R_theta is approximately
+    # constant across load levels because the cold-plate thermal resistance dominates.
+    # Idle and load R_theta are the same value. The classifier cannot use the
+    # idle/load R_theta gap as a signal — classification is based on P-state + power.
+    # Drift detection IS still valid: TIM degradation raises R_theta_junction uniformly.
+    #
+    # T_ref must be the coolant inlet temperature (BMC Redfish), NOT the idle junction
+    # temperature. If T_ref = T_j_idle ≈ 25 °C, then ΔT at idle ≈ 0 and R_theta is
+    # invalid (below MIN_DELTA_T). See t_ref_strategy = "coolant_inlet".
     "b200": ThermalProfile(
         family="blackwell",
         canonical_name="B200-SXM6",
@@ -196,21 +231,25 @@ _PROFILES: dict[str, ThermalProfile] = {
         tdp_w=1000.0,  # nominal; some variants up to 1200W
         idle_floor_w=85.0,
         junction_max_c=100.0,
-        expected_ambient_c=20.0,
-        # Dual-die package + larger HBM3e stack count → larger effective surface,
-        # but 2.5× T4's TDP density. Net R_theta predicted ~0.27 load.
-        rtheta_load_threshold=0.35,
-        rtheta_idle_threshold=0.65,
-        rtheta_expected_under_load=0.27,
-        rtheta_expected_idle=0.55,
-        rtheta_drift_warn_c_per_day=0.0005,
-        rtheta_drift_crit_c_per_day=0.0025,
+        expected_ambient_c=20.0,  # DGX B200 facility coolant supply spec
+        # Liquid-cooled R_theta is constant across load — ~0.060 C/W healthy.
+        # Degradation threshold at +20% above healthy: 0.060 * 1.20 = 0.072 C/W.
+        # idle_threshold intentionally equal to load_threshold (no gap in liquid cooling).
+        rtheta_load_threshold=0.072,   # > this at P0 → zombie; drift otherwise
+        rtheta_idle_threshold=0.072,   # same boundary — no idle/load R_theta gap
+        rtheta_expected_under_load=0.060,  # physics-derived, pending Stage 2 measurement
+        rtheta_expected_idle=0.060,        # same as load for liquid cooling
+        rtheta_drift_warn_c_per_day=0.0003,   # 0.3 mC/W/day — compressed range
+        rtheta_drift_crit_c_per_day=0.0012,
         cooling="liquid-cold-plate",
+        t_ref_strategy="coolant_inlet",   # use BMC inlet or expected_ambient_c as T_ref
+        drift_min_std=0.002,              # 2 mC/W floor (vs 10 mC/W for T4)
         confidence="extrapolated",
         notes=(
-            "Dual-die package — each die has its own R_theta; report aggregate.",
-            "Inter-die thermal coupling may produce asymmetric loading patterns.",
-            "Predicted values pending first-party measurement on Cal Poly DGX B200.",
+            "Dual-die CoWoS-L package — NVML may report per-die power (~450W each at full load).",
+            "R_theta is constant across idle/load; only degradation changes it.",
+            "T_ref must be coolant-inlet (BMC Redfish) not idle junction — see t_ref_strategy.",
+            "Pending first-party Stage 2 measurement on Cal Poly DGX B200 (E005+).",
         ),
     ),
 

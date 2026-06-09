@@ -117,20 +117,38 @@ def derive_thresholds(
 
     When both phases are observed the gap between them is split 35/20 —
     creating a narrow dead-zone that prevents flip-flopping near the boundary.
-    When only idle is observed the T4 idle/load ratio is scaled to the new floor.
+
+    When only idle is observed the T4 idle/load ratio is scaled to the new floor,
+    BUT only when a meaningful idle/load gap exists (air-cooled hardware). For
+    liquid-cooled hardware where rtheta_idle ≈ rtheta_load, the T4 ratio scaling
+    would produce a load_threshold below the actual healthy load R_theta — instead
+    we add a fixed +20% margin above the measured R_theta to define the thresholds.
     """
     if rtheta_load is not None:
         gap = rtheta_idle - rtheta_load
+        if gap < 0.01:
+            # Liquid-cooled or perfectly calibrated: idle ≈ load.
+            # Threshold = healthy_value + 20% margin above for degradation detection.
+            return (
+                round(rtheta_idle * 1.20, 3),
+                round(rtheta_idle * 1.40, 3),
+            )
         return (
             round(rtheta_load + gap * 0.35, 3),
             round(rtheta_idle - gap * 0.20, 3),
         )
     ratio_load = _T4_LOAD_THRESHOLD / _T4_RTHETA_IDLE
     ratio_idle = _T4_IDLE_THRESHOLD / _T4_RTHETA_IDLE
-    return (
-        round(rtheta_idle * ratio_load, 3),
-        round(rtheta_idle * ratio_idle, 3),
-    )
+    load_thr = round(rtheta_idle * ratio_load, 3)
+    idle_thr = round(rtheta_idle * ratio_idle, 3)
+    if load_thr >= rtheta_idle:
+        # Ratio scaling overshot — liquid-cooled case where idle R_theta is very small.
+        # Apply fixed +20%/+40% margins instead of T4-ratio extrapolation.
+        return (
+            round(rtheta_idle * 1.20, 3),
+            round(rtheta_idle * 1.40, 3),
+        )
+    return (load_thr, idle_thr)
 
 
 class _PhaseAccumulator:

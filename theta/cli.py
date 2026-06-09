@@ -343,14 +343,26 @@ def calibrate(
         bm.set_external_ambient(gpu, ambient, source="manual_ambient_flag")
 
         # Derive expected idle R_θ from profile + supplied ambient.
-        # R_θ_idle = profile.rtheta_expected_idle (physics-based estimate).
-        # This gives the classifier a plausible idle threshold even without
-        # observing an actual idle window — better than T4 defaults on B200/H100.
-        rtheta_idle = profile.rtheta_expected_idle
+        # For air-cooled hardware: R_θ_idle differs from R_θ_load so the profile's
+        # rtheta_expected_idle gives a useful calibration anchor.
+        # For liquid-cooled hardware (t_ref_strategy='coolant_inlet'): R_θ_idle ≈
+        # R_θ_load — the T4-ratio idle-only scaling in derive_thresholds() would
+        # produce a load_threshold BELOW the actual healthy load R_θ, causing all
+        # normal load windows to be classified as DRIFTING. Use the profile's pre-
+        # computed thresholds directly for liquid-cooled hardware instead.
+        _strategy = getattr(profile, "t_ref_strategy", "idle_window")
+        if _strategy == "coolant_inlet":
+            # Liquid-cooled: R_θ_idle ≈ R_θ_load = rtheta_expected_under_load.
+            # The profile thresholds are already calibrated for this regime.
+            rtheta_idle = profile.rtheta_expected_under_load
+        else:
+            rtheta_idle = profile.rtheta_expected_idle
         console.print(
             f"[yellow]⚠[/yellow]  [bold]--ambient mode[/bold]: skipping idle-phase wait.\n"
             f"  Using supplied ambient [bold]{ambient:.1f} °C[/bold] as T_ref, "
-            f"profile R_θ_idle estimate [bold]{rtheta_idle:.4f} C/W[/bold].\n"
+            f"profile R_θ_idle estimate [bold]{rtheta_idle:.4f} C/W[/bold]"
+            + (" [dim](liquid-cooled: R_θ_idle ≈ R_θ_load)[/dim]" if _strategy == "coolant_inlet" else "")
+            + f".\n"
             f"  [dim]Accuracy is lower than an observed idle window. "
             f"Re-run without --ambient during a maintenance window for best results.[/dim]\n"
         )
@@ -413,8 +425,29 @@ def calibrate(
             console.print(f"[green]✓[/green] Load R_θ locked: [bold]{rtheta_load:.4f} C/W[/bold]\n")
 
     # ── Derive thresholds + save ──────────────────────────────────────────────
-    load_threshold, idle_threshold = derive_thresholds(rtheta_idle, rtheta_load)
-    source = "observed_both" if rtheta_load is not None else "idle_only"
+    # For liquid-cooled hardware (t_ref_strategy='coolant_inlet') in --ambient mode,
+    # derive_thresholds() with idle-only path applies T4-ratio scaling which produces
+    # a load_threshold well below the actual healthy load R_theta (because T4 assumes
+    # idle >> load, but liquid-cooled idle ≈ load). Use the profile's precomputed
+    # thresholds when no load observation is available on coolant_inlet hardware.
+    _use_profile_thresholds = (
+        ambient is not None
+        and rtheta_load is None
+        and "profile" in locals()  # profile was set in the --ambient block
+        and getattr(profile, "t_ref_strategy", "idle_window") == "coolant_inlet"
+    )
+    if _use_profile_thresholds:
+        load_threshold = profile.rtheta_load_threshold
+        idle_threshold = profile.rtheta_idle_threshold
+        source = "profile_liquid_cooled"
+        console.print(
+            f"  [dim]Liquid-cooled hardware: using profile thresholds "
+            f"(load={load_threshold:.3f}, idle={idle_threshold:.3f}) "
+            f"instead of T4-ratio scaling.[/dim]\n"
+        )
+    else:
+        load_threshold, idle_threshold = derive_thresholds(rtheta_idle, rtheta_load)
+    source = "observed_both" if rtheta_load is not None else ("profile_liquid_cooled" if _use_profile_thresholds else "idle_only")
 
     result = CalibrationResult(
         gpu_index       = gpu,

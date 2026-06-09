@@ -257,16 +257,20 @@ class ThetaAgent:
                 await self._router.route(silicon_alert)
 
         # 1. Update virtual ambient — hard lock on first idle window,
-        #    soft exponential-smoothing update during long-run transient idles
+        #    soft exponential-smoothing update during long-run transient idles.
+        #    gpu_name is passed so liquid-cooled profiles (t_ref_strategy='coolant_inlet')
+        #    skip idle-window locking and use BMC inlet / expected_ambient_c instead.
+        _gpu_name = self._collector_gpu_names.get(gpu) if hasattr(self, "_collector_gpu_names") else None
         self._baseline.update(
             gpu, raw_sample.temp_junction,
-            raw_sample.util_pct, raw_sample.perf_state, ts
+            raw_sample.util_pct, raw_sample.perf_state, ts,
+            gpu_name=_gpu_name,
         )
         self._baseline.maybe_update_longrun(
             gpu, raw_sample.temp_junction,
             raw_sample.util_pct, raw_sample.perf_state, ts
         )
-        t_ref = self._baseline.get_t_ref(gpu)
+        t_ref = self._baseline.get_t_ref(gpu, _gpu_name)
 
         # 2. Compute R_theta
         enriched = enrich(raw_sample, t_ref)
@@ -828,22 +832,42 @@ class ThetaAgent:
             # defaults — fixes silent misclassification on H100/B200/MI300X.
             # Also seed baseline with the profile's expected ambient so the
             # first R_θ computations aren't biased by a flat 25°C assumption.
+            _min_std_values: list[float] = []
             for slot, name in self._collector_gpu_names.items():
                 profile = self._classifier.register_gpu(slot, name)
                 if profile is not None:
                     self._baseline.seed_from_profile(slot, name)
+                    _min_std_values.append(getattr(profile, "drift_min_std", 0.010))
                     log.info(
                         "gpu_registered",
                         slot=slot, name=name,
                         family=profile.family, vendor=profile.vendor,
                         load_threshold=profile.rtheta_load_threshold,
                         cooling=profile.cooling,
+                        t_ref_strategy=getattr(profile, "t_ref_strategy", "idle_window"),
+                        drift_min_std=getattr(profile, "drift_min_std", 0.010),
                     )
                 else:
                     log.warning(
                         "gpu_unprofiled",
                         slot=slot, name=name,
                         note="no hardware profile matched — using T4 defaults",
+                    )
+            # Use the smallest min_std across all profiled GPUs so the fleet
+            # detector sensitivity honours the hardware with the tightest range.
+            if _min_std_values:
+                _effective_min_std = min(_min_std_values)
+                if _effective_min_std != 0.010:
+                    # Rebuild detector with correct noise floor for this hardware
+                    self._detector = DriftDetector(
+                        self.config.k_warn,
+                        self.config.k_critical,
+                        min_std=_effective_min_std,
+                    )
+                    log.info(
+                        "drift_detector_reconfigured",
+                        min_std=_effective_min_std,
+                        reason="hardware profile drift_min_std override",
                     )
 
             # Wire GPU names into the fleet correlator for NVLink topology detection

@@ -62,11 +62,13 @@ class DriftDetector:
         k_critical: float = K_SIGMA_CRITICAL,
         baseline_n: int   = BASELINE_WINDOW,
         sustained:  int   = SUSTAINED_WINDOWS,
+        min_std:    float = 0.010,
     ):
         self._k_warn     = k_warn
         self._k_critical = k_critical
         self._baseline_n = baseline_n
         self._sustained  = sustained
+        self._min_std    = min_std   # per-detector noise floor; override for liquid-cooled HW
 
         self._baselines:      dict[int, deque]         = {}
         self._anomaly_counts: dict[int, int]           = {}
@@ -109,8 +111,11 @@ class DriftDetector:
         mean = sum(vals) / len(vals)
         std  = math.sqrt(sum((v - mean) ** 2 for v in vals) / len(vals))
 
-        # Guard against near-zero std (perfectly stable baseline)
-        std = max(std, 0.01)
+        # Guard against near-zero std (perfectly stable baseline).
+        # Floor scales with hardware class — liquid-cooled GPUs have compressed
+        # R_theta range (~0.06 C/W) so the T4-derived 0.01 floor would swamp
+        # the degradation signal (~0.014 C/W for +23% TIM degradation).
+        std = max(std, self._min_std)
 
         sigma_score = (rtheta - mean) / std
 

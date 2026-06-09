@@ -127,8 +127,34 @@ class BaselineManager:
 
     # ── Update ────────────────────────────────────────────────────────────────
 
-    def update(self, gpu_index: int, temp: float, util: float, pstate: int, ts: float) -> None:
-        """Feed a new sample. If idle window detected, lock baseline."""
+    def _should_lock_from_idle(self, gpu_index: int, gpu_name: str | None = None) -> bool:
+        """Return False for liquid-cooled hardware where coolant inlet is the right T_ref."""
+        if not gpu_name:
+            return True
+        prof = resolve_profile(gpu_name)
+        if prof is None:
+            return True
+        return getattr(prof, "t_ref_strategy", "idle_window") != "coolant_inlet"
+
+    def update(
+        self,
+        gpu_index: int,
+        temp: float,
+        util: float,
+        pstate: int,
+        ts: float,
+        gpu_name: str | None = None,
+    ) -> None:
+        """Feed a new sample. If idle window detected, lock baseline.
+
+        For liquid-cooled hardware (t_ref_strategy='coolant_inlet') this is a no-op —
+        the idle junction temperature is too close to the coolant temperature to be a
+        useful T_ref reference. Use set_external_ambient() with the BMC inlet reading
+        instead, or the profile's expected_ambient_c will be used as fallback.
+        """
+        if not self._should_lock_from_idle(gpu_index, gpu_name):
+            return
+
         is_idle = util <= IDLE_UTIL_MAX and pstate >= IDLE_PSTATE_MIN
 
         if gpu_index not in self._buffers:
