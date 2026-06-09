@@ -44,6 +44,7 @@ from .redfish_collector  import RedfishEnricher
 from .alerter            import AlertRouter, StdoutAlerter, WebhookAlerter, FileAlerter
 from .health_api         import HealthAPIServer
 from .fault_classifier   import FaultCurveClassifier, FaultCause
+from .profile_learner    import ProfileLearner
 from ..                  import __version__
 from .exporter   import PrometheusExporter
 
@@ -90,6 +91,11 @@ class AgentConfig:
 
     # Theta Intelligence Network — anonymized telemetry opt-in
     data_sharing:       bool  = False
+
+    # Auto-recalibrate after CRITICAL→RECOVERY transitions.
+    # When True, spawns `theta calibrate --gpu N` subprocess after a
+    # 5-min stable cooldown. When False (default), logs a suggestion instead.
+    auto_recalibrate:   bool  = False
 
 
 class ThetaAgent:
@@ -178,6 +184,18 @@ class ThetaAgent:
 
         self._tick_count  = 0
         self._alert_count = 0
+
+        # ── Self-improvement modules ──────────────────────────────────────────
+        # Profile learner: fires once per GPU when enough load samples
+        # exist to upgrade hw_profiles.py confidence to 'measured'.
+        self._profile_learner = ProfileLearner()
+        # Auto-recalibrate queue: GPUs that recovered from anomaly and need
+        # a recalibration pass before next alert cycle.
+        self._recal_queue: set[int] = set()
+        self._recal_cooldown_ts: dict[int, float] = {}
+        # Model drift tracker: count critic/classifier disagreements per GPU.
+        self._critic_disagree: dict[int, int] = {}
+        self._critic_total: dict[int, int] = {}
 
     def _build_router(self) -> AlertRouter:
         router = AlertRouter()
@@ -345,8 +363,21 @@ class ThetaAgent:
             self._alert_count += 1
             self._exporter.record_alert(critic_alert)
             await self._router.route(critic_alert)
+            # Track disagreement for model drift monitoring
+            self._critic_disagree[gpu] = self._critic_disagree.get(gpu, 0) + 1
+        self._critic_total[gpu] = self._critic_total.get(gpu, 0) + 1
         self._exporter.update_drift(drift)
         self._exporter.update_state(gpu, state)
+
+        # Profile learner — accumulate load R_θ samples toward upgrade signal
+        _gpu_name_pl = self._collector_gpu_names.get(gpu, "unknown") if hasattr(self, "_collector_gpu_names") else "unknown"
+        self._profile_learner.update(
+            gpu_index  = gpu,
+            gpu_name   = _gpu_name_pl,
+            rtheta_mean= window.rtheta_mean,
+            power_w    = raw_sample.power_w,
+            is_stable  = window.is_stable,
+        )
 
         # 5b. Fault curve classifier — R_theta curve shape analysis (dust/TIM/fan/blockage)
         fault = self._fault_classifier.update(
@@ -420,6 +451,21 @@ class ThetaAgent:
             if alert.state not in (GPUState.CLEAN_IDLE, GPUState.UNDER_LOAD):
                 explanation = self._classifier.explain(window)
                 log.info("classification_reason", gpu=gpu, reason=explanation)
+
+            # Auto-recalibrate: queue GPU when it recovers from an anomalous state.
+            # A recalibration pass refreshes the baseline after a real incident
+            # (TIM/cooling degradation changes the unit's R_theta permanently).
+            _recovery_states = (GPUState.CLEAN_IDLE, GPUState.UNDER_LOAD)
+            _anomalous_from = {GPUState.CRITICAL, GPUState.DRIFTING, GPUState.ZOMBIE_RECOVERY}
+            if alert.state in _recovery_states and alert.prev_state in _anomalous_from:
+                self._recal_queue.add(gpu)
+                self._recal_cooldown_ts[gpu] = ts
+                log.info(
+                    "recalibration_queued",
+                    gpu=gpu,
+                    prev_state=alert.prev_state.name if hasattr(alert.prev_state, "name") else str(alert.prev_state),
+                    note="GPU recovered — recalibration recommended within 5 min",
+                )
 
         # 7. Predictive alert — warn before the threshold is crossed
         if drift.is_predictive:
@@ -911,6 +957,98 @@ class ThetaAgent:
                             self._alert_count += 1
                             self._exporter.record_alert(sdc_alert)
                             await self._router.route(sdc_alert)
+
+                    # ── Self-improvement periodic tasks ───────────────────
+                    # Profile upgrade check — every 100 ticks (~8 min)
+                    if self._tick_count % 100 == 0:
+                        for _gpu_idx in list(self._collector_gpu_names or {}).copy():
+                            _upgrade = self._profile_learner.ready_to_upgrade(_gpu_idx)
+                            if _upgrade is not None:
+                                log.info(
+                                    "profile_upgrade_ready",
+                                    action="update hw_profiles.py confidence to 'measured'",
+                                    **_upgrade.as_log_dict(),
+                                )
+                                # Also emit as a structured alert so operators see it
+                                _upgrade_alert = AlertEvent(
+                                    gpu_index       = _gpu_idx,
+                                    timestamp       = raw_sample.timestamp,
+                                    state           = self._statemachine.get_state(_gpu_idx),
+                                    prev_state      = self._statemachine.get_state(_gpu_idx),
+                                    rtheta          = _upgrade.rtheta_mean,
+                                    rtheta_baseline = _upgrade.rtheta_mean,
+                                    drift_sigma     = 0.0,
+                                    confidence      = 0.99,
+                                    message         = (
+                                        f"[INFO] GPU {_gpu_idx} ({_upgrade.gpu_name}) — "
+                                        f"profile upgrade ready. {_upgrade.n_samples} load samples: "
+                                        f"R_θ={_upgrade.rtheta_mean:.4f} ± {_upgrade.rtheta_std:.5f} C/W. "
+                                        f"Run: theta calibrate --gpu {_gpu_idx}. "
+                                        f"Then update hw_profiles.py confidence to 'measured'."
+                                    ),
+                                    context         = {
+                                        "severity":         "info",
+                                        "profile_upgrade":  True,
+                                        "rtheta_mean":      _upgrade.rtheta_mean,
+                                        "rtheta_std":       _upgrade.rtheta_std,
+                                        "warn_threshold":   _upgrade.warn_threshold,
+                                        "crit_threshold":   _upgrade.crit_threshold,
+                                        "n_samples":        _upgrade.n_samples,
+                                    },
+                                )
+                                await self._router.route(_upgrade_alert)
+
+                    # Auto-recalibrate — check queue every 60 ticks, 5-min cooldown
+                    if self._tick_count % 60 == 0 and self._recal_queue:
+                        _now = raw_sample.timestamp
+                        for _recal_gpu in list(self._recal_queue):
+                            _queued_ts = self._recal_cooldown_ts.get(_recal_gpu, 0.0)
+                            if _now - _queued_ts < 300:  # 5-min stable cooldown
+                                continue
+                            self._recal_queue.discard(_recal_gpu)
+                            if getattr(self.config, "auto_recalibrate", False):
+                                import asyncio as _asyncio
+                                import sys as _sys
+                                log.info("auto_recalibrate_start", gpu=_recal_gpu)
+                                try:
+                                    await _asyncio.create_subprocess_exec(
+                                        _sys.executable, "-m", "theta.cli",
+                                        "calibrate", "--gpu", str(_recal_gpu),
+                                        "--non-interactive",
+                                    )
+                                except Exception as _e:
+                                    log.error("auto_recalibrate_failed", gpu=_recal_gpu, error=str(_e))
+                            else:
+                                log.info(
+                                    "recalibration_recommended",
+                                    gpu=_recal_gpu,
+                                    action=f"theta calibrate --gpu {_recal_gpu}",
+                                    note="GPU has been stable 5+ min post-recovery",
+                                )
+
+                    # Model drift monitor — every 1000 ticks (~83 min)
+                    if self._tick_count % 1000 == 0 and self._critic_total:
+                        for _gpu_idx, _total in self._critic_total.items():
+                            if _total < 100:
+                                continue
+                            _disagree = self._critic_disagree.get(_gpu_idx, 0)
+                            _rate = _disagree / _total
+                            if _rate > 0.15:
+                                log.warning(
+                                    "model_drift_detected",
+                                    gpu=_gpu_idx,
+                                    disagreement_rate=round(_rate, 3),
+                                    total_windows=_total,
+                                    action="theta train <path/to/data.csv> to retrain",
+                                    note=(
+                                        "Isolation Forest and DT classifier disagree on >15% of "
+                                        "windows — operating conditions may have drifted from "
+                                        "Stage 1 training data. Consider retraining."
+                                    ),
+                                )
+                        # Reset counters after check
+                        self._critic_disagree.clear()
+                        self._critic_total.clear()
 
                     # Redfish chassis poll — every 60 ticks (~5 min)
                     if self._redfish and self._tick_count % 60 == 0:
