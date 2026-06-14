@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import signal
 from collections import deque
 from contextlib import contextmanager
@@ -33,6 +34,7 @@ from .window     import SteadyStateWindow, SIGMA_STRICT
 from .classifier import StateClassifier
 from .calibrate  import CalibrationManager
 from .detector   import DriftDetector
+from .peer       import PeerRelativeDetector
 from .state      import GPUStateMachine
 from .correlator import FleetCorrelator
 from .silicon         import EccMonitor, MicroThrottleDetector, XIDParser
@@ -125,6 +127,15 @@ class ThetaAgent:
             calibration=self._calibration,
         )
         self._detector     = DriftDetector(config.k_warn, config.k_critical)
+        # Peer-relative (E009) detector — cross-sectional, no warm-up, fleet-only.
+        # Complements the temporal DriftDetector: catches a GPU that is an
+        # outlier vs its matched-power node-mates right now, including units
+        # degraded since before monitoring began (which the temporal path can't
+        # see). Self-disables on <4 matched-power peers, so single/dual-GPU hosts
+        # never peer-alarm. See peer.py.
+        self._peer         = PeerRelativeDetector()
+        self._gpu_rtheta:   dict[int, float] = {}   # latest valid R_θ per GPU (fleet snapshot)
+        self._peer_alerted: dict[int, float] = {}   # gpu → last peer-alert ts (cooldown)
         self._statemachine   = GPUStateMachine()
         self._correlator     = FleetCorrelator()
         self._ecc_monitor    = EccMonitor()
@@ -387,6 +398,11 @@ class ThetaAgent:
         # 5. Drift detection + unsupervised critic
         # (detector itself is CRITICAL path — the state machine consumes drift)
         drift = self._detector.update(gpu, ts, window.rtheta_mean, state)
+
+        # Record this GPU's R_θ into the live fleet snapshot for the
+        # peer-relative detector (evaluated once per cycle in the run loop).
+        if window.rtheta_mean is not None and math.isfinite(window.rtheta_mean):
+            self._gpu_rtheta[gpu] = window.rtheta_mean
 
         with self._stage("critic", gpu):
             # Feed healthy windows to the Isolation Forest baseline
@@ -858,6 +874,68 @@ class ThetaAgent:
         else:
             log.info("config_reloaded", changes="no_op_no_changes_detected")
 
+    # Peer alerts are deliberately rare (a degraded GPU stays degraded), so one
+    # alert per GPU per cooldown is plenty and keeps the false-positive budget
+    # — and the operator's inbox — quiet.
+    PEER_ALERT_COOLDOWN_S = 300
+
+    async def _run_peer_detection(self, ts: float) -> None:
+        """
+        Cross-sectional peer-relative pass (the E009 method). Builds the current
+        fleet snapshot from each GPU's latest R_θ + power and flags any GPU that
+        is a *sustained* outlier vs its matched-power node-mates — including
+        units that were already degraded when monitoring started, which the
+        temporal DriftDetector structurally cannot catch. Self-disables on a
+        sub-fleet (the detector needs ≥4 matched-power peers). At most one alert
+        per GPU per PEER_ALERT_COOLDOWN_S.
+        """
+        snapshot = {
+            g: (self._gpu_power[g], self._gpu_rtheta[g])
+            for g in self._gpu_rtheta
+            if self._gpu_power.get(g, 0.0) > 0
+        }
+        if len(snapshot) < 4:          # cheap early-out — peer detection is fleet-only
+            return
+
+        for gpu, r in self._peer.evaluate(snapshot, ts).items():
+            if not r.is_anomaly:
+                continue
+            if ts - self._peer_alerted.get(gpu, 0.0) < self.PEER_ALERT_COOLDOWN_S:
+                continue
+            self._peer_alerted[gpu] = ts
+
+            pct = 100.0 * (r.rtheta - r.peer_median) / r.peer_median if r.peer_median else 0.0
+            severity = GPUState.CRITICAL if r.is_critical else GPUState.DRIFTING
+            msg = (
+                f"GPU {gpu} R_θ={r.rtheta:.3f} C/W sits {r.robust_z:.1f}σ above its "
+                f"{r.n_peers} matched-power node-mates (peer median {r.peer_median:.3f} "
+                f"C/W, +{pct:.0f}%) at {r.power_w:.0f} W — peer-relative anomaly, no "
+                f"per-GPU baseline required."
+            )
+            alert = AlertEvent(
+                gpu_index       = gpu,
+                timestamp       = ts,
+                state           = severity,
+                prev_state      = GPUState.UNKNOWN,   # not a temporal transition
+                rtheta          = r.rtheta,
+                rtheta_baseline = r.peer_median,       # the peer cohort IS the baseline
+                drift_sigma     = r.robust_z,
+                confidence      = r.confidence,
+                message         = msg,
+                context         = {
+                    "detector": "peer_relative",
+                    "robust_z": r.robust_z,
+                    "peer_median": r.peer_median,
+                    "peer_scale": r.peer_scale,
+                    "n_peers": r.n_peers,
+                    "power_w": r.power_w,
+                    "pct_above_peers": round(pct, 1),
+                },
+            )
+            self._alert_count += 1
+            self._exporter.record_alert(alert)
+            await self._router.route(alert)
+
     async def run(self) -> None:
         """Main loop. Blocks until shutdown signal received."""
         loop = asyncio.get_running_loop()
@@ -1001,6 +1079,11 @@ class ThetaAgent:
                             self._alert_count += 1
                             self._exporter.record_alert(sdc_alert)
                             await self._router.route(sdc_alert)
+
+                        # Peer-relative (E009) detection — same cadence, runs on
+                        # the current fleet snapshot. No-op on <4 matched-power
+                        # peers (handled inside the detector).
+                        await self._run_peer_detection(raw_sample.timestamp)
 
                     # ── Self-improvement periodic tasks ───────────────────
                     # Profile upgrade check — every 100 ticks (~8 min)
