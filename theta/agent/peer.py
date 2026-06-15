@@ -169,3 +169,65 @@ def _power_matched(p1: float, p2: float, tol: float) -> bool:
     if p1 <= 0 or p2 <= 0:
         return False
     return abs(p1 - p2) <= tol * p1
+
+
+# ── Position-conditioned (fleet) scoring — the full E009 median-polish ────────
+#
+# The PeerRelativeDetector above compares a GPU to its node-mates directly. That
+# catches an unambiguous outlier (E009's j13g2:7, +58%) but MISSES units whose
+# anomaly is masked by HGX baseboard-position structure: on Della, position
+# effects span ±11% of μ (hot ordinals {0,3,4,6}, cool {1,2,5,7}) — bigger than
+# the 3.7% residual noise floor. A hot GPU sitting in a structurally-cool slot
+# can read at or below its node median yet be genuinely degraded (E009's
+# j13g2:2 was −2.5% within-node but +12% after position correction).
+#
+# Removing that structure needs a *fleet*: several nodes that share the ordinal
+# layout, so the per-ordinal effect can be estimated by pooling the same slot
+# across nodes. This is therefore a fleet-service capability, not something a
+# single-node agent can do alone. Two-way (node × ordinal) median polish is the
+# E009 method; it reproduces all 3 Della flags at zero false positives.
+
+def median_polish_z(
+    fleet: dict[int, tuple[str, int, float]],
+    iterations: int = 20,
+    rel_floor: float = REL_FLOOR,
+) -> dict[int, float]:
+    """
+    Position-conditioned robust-z for a multi-node fleet.
+
+    fleet: {gpu_id: (node, ordinal, rtheta)} — callers should pass only
+    matched-power, steady-load GPUs (R_θ is a curve in P). Decomposes
+    R(node, ordinal) = μ + node_effect + ordinal_effect + residual via Tukey
+    two-way median polish, then scores each residual against the robust σ
+    (1.4826·MAD of residuals, floored relative to μ). Returns {gpu_id: robust_z}.
+    GPUs whose (node, ordinal) cell is unique enough to be unpolishable are
+    still returned with their residual z.
+    """
+    cells = {(node, ordn): (gid, rt) for gid, (node, ordn, rt) in fleet.items()}
+    nodes = sorted({n for n, _ in cells})
+    ords  = sorted({o for _, o in cells})
+
+    res = {k: cells[k][1] for k in cells}            # residuals, polished in place
+    for _ in range(iterations):
+        for n in nodes:                              # sweep node (row) medians
+            row = [res[(n, o)] for o in ords if (n, o) in res]
+            if row:
+                m = statistics.median(row)
+                for o in ords:
+                    if (n, o) in res:
+                        res[(n, o)] -= m
+        for o in ords:                               # sweep ordinal (col) medians
+            col = [res[(n, o)] for n in nodes if (n, o) in res]
+            if col:
+                m = statistics.median(col)
+                for n in nodes:
+                    if (n, o) in res:
+                        res[(n, o)] -= m
+
+    resid = list(res.values())
+    rmed  = statistics.median(resid)
+    mad   = statistics.median([abs(x - rmed) for x in resid])
+    grand = statistics.median([cells[k][1] for k in cells])
+    sigma = max(MAD_K * mad, rel_floor * grand)
+
+    return {cells[k][0]: round(res[k] / sigma, 2) for k in cells}

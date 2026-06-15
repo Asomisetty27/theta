@@ -9,7 +9,7 @@ this safe to ship as a fleet default).
 """
 
 from theta.agent.peer import (
-    PeerRelativeDetector, _power_matched, MIN_GROUP, SUSTAINED,
+    PeerRelativeDetector, median_polish_z, _power_matched, MIN_GROUP, SUSTAINED,
 )
 
 
@@ -111,3 +111,46 @@ def test_power_matched_helper():
     assert _power_matched(600.0, 650.0, 0.15)        # within 15%
     assert not _power_matched(600.0, 800.0, 0.15)    # 33% apart
     assert not _power_matched(600.0, 0.0, 0.15)      # zero/invalid power
+
+
+# ── Position-conditioned median polish (the full E009 fleet method) ───────────
+
+def test_median_polish_recovers_position_masked_anomaly():
+    # Synthetic 8-node × 8-ordinal fleet with a real HGX-position structure
+    # (hot ordinals 0,3,4,6 like Della) plus one degraded GPU sitting in a
+    # STRUCTURALLY-COOL slot — so within-node it looks fine, but after position
+    # correction it is a clear outlier. This is the j13g2:2 situation.
+    mu = 0.057
+    pos = {0: +0.006, 1: -0.003, 2: -0.007, 3: +0.003,
+           4: +0.007, 5: -0.006, 6: +0.005, 7: -0.004}
+    fleet = {}
+    gid = 0
+    for n in range(8):
+        node_eff = (n - 3.5) * 0.0004
+        for o in range(8):
+            r = mu + node_eff + pos[o]
+            fleet[gid] = (f"n{n}", o, r)
+            gid += 1
+    # Degrade one GPU in a cool slot (ordinal 2) on node n5 by +0.010 (~+17%).
+    masked_id = next(g for g, (nn, oo, _) in fleet.items() if nn == "n5" and oo == 2)
+    nn, oo, r = fleet[masked_id]
+    fleet[masked_id] = (nn, oo, r + 0.010)
+
+    z = median_polish_z(fleet)
+    assert z[masked_id] > 3.0, f"position-masked anomaly should surface, got {z[masked_id]}"
+    # Nobody else should clear z>3.
+    others = [v for k, v in z.items() if k != masked_id]
+    assert max(others) < 3.0
+
+
+def test_median_polish_uniform_fleet_is_quiet():
+    mu = 0.060
+    pos = {o: (o - 3.5) * 0.002 for o in range(8)}
+    fleet = {}
+    gid = 0
+    for n in range(6):
+        for o in range(8):
+            fleet[gid] = (f"n{n}", o, mu + pos[o] + n * 0.0003)
+            gid += 1
+    z = median_polish_z(fleet)
+    assert all(abs(v) < 3.0 for v in z.values())
