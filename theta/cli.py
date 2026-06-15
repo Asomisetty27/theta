@@ -8,6 +8,7 @@ Commands:
   baseline    Run a baseline-only idle window scan
   calibrate   Measure hardware-specific R_theta thresholds (run once on non-T4 GPUs)
   classify    Single-snapshot classify all GPUs
+  fleet-scan  Position-conditioned cross-node anomaly scan (the E009 method)
   serve       Run agent + Prometheus metrics server only
   train       Retrain bundled models from Stage 1 CSV
 """
@@ -369,6 +370,118 @@ def _print_classify_table(windows, clf) -> None:
         )
 
     console.print(t)
+
+
+# ── fleet-scan ────────────────────────────────────────────────────────────────
+
+def _load_fleet_records(path: Path) -> list[dict]:
+    """
+    Normalize a fleet R_θ export into [{node, ordinal, rtheta, power, gpu}].
+
+    Accepts two shapes:
+      1. A flat list of records: [{"node","ordinal","rtheta","power"?}, ...]
+      2. The analysis "results.json" shape: {"steady_bad": {"node:ord":
+         {"r_mean","P_mean",...}}} — the format the E009 Princeton export uses,
+         so `theta fleet-scan` runs on real multi-node data out of the box.
+    """
+    data = json.loads(path.read_text())
+    records: list[dict] = []
+
+    if isinstance(data, dict) and ("steady_bad" in data or "steady" in data):
+        block = data.get("steady_bad") or data.get("steady") or {}
+        for key, g in block.items():
+            node, _, ordn = key.partition(":")
+            records.append({
+                "gpu": key, "node": node, "ordinal": int(ordn or 0),
+                "rtheta": g["r_mean"], "power": g.get("P_mean", 0.0),
+            })
+    elif isinstance(data, list):
+        for i, r in enumerate(data):
+            records.append({
+                "gpu": r.get("gpu", f'{r.get("node","?")}:{r.get("ordinal","?")}'),
+                "node": str(r["node"]), "ordinal": int(r["ordinal"]),
+                "rtheta": float(r["rtheta"]), "power": float(r.get("power", 0.0)),
+            })
+    else:
+        raise ValueError("unrecognized fleet export shape — expected a record "
+                         "list or a results.json with a 'steady_bad' block")
+    return records
+
+
+@app.command(name="fleet-scan")
+def fleet_scan(
+    export:    str   = typer.Argument(..., help="Path to a multi-node R_θ export (record list or results.json)"),
+    z_thresh:  float = typer.Option(3.0, "--z", help="Robust-z threshold to flag a unit"),
+    power_tol: float = typer.Option(0.15, "--power-tol", help="Only compare GPUs within ±this fractional power"),
+):
+    """
+    Position-conditioned cross-node anomaly scan — the E009 fleet method.
+
+    Pools R_θ across nodes that share the HGX baseboard layout and runs two-way
+    (node × ordinal) median polish, so per-position thermal structure is removed
+    before scoring. This catches degraded units that a single-node within-node
+    comparison misses (on the real Princeton data: 3/3 vs 1/3). It needs MULTIPLE
+    nodes — a single node cannot separate node effect from position effect; for a
+    single host, the live agent's within-node peer detector is the right tool.
+    """
+    from .agent.peer import median_polish_z
+
+    path = Path(export)
+    if not path.exists():
+        console.print(f"[red]export not found:[/] {export}")
+        raise typer.Exit(2)
+
+    records = _load_fleet_records(path)
+
+    # Power-condition: R_θ is a curve in P, so only compare GPUs at matched load.
+    # Use the median power as the reference band; drop GPUs outside ±power_tol
+    # (e.g. idle nodes) so they aren't scored against a loaded cohort.
+    powered = [r for r in records if r["power"] > 0]
+    if powered:
+        ref_p = sorted(r["power"] for r in powered)[len(powered) // 2]
+        matched = [r for r in powered if abs(r["power"] - ref_p) <= power_tol * ref_p]
+    else:
+        matched = records  # no power data — score everything (best effort)
+
+    nodes = {r["node"] for r in matched}
+    if len(nodes) < 2:
+        console.print(
+            f"[yellow]fleet-scan needs ≥2 nodes; this export has {len(nodes)}.[/]\n"
+            "Position-conditioning is undefined on a single node — run the live "
+            "agent ([bold]theta monitor[/]) for within-node peer detection instead."
+        )
+        raise typer.Exit(1)
+
+    fleet = {r["gpu"]: (r["node"], r["ordinal"], r["rtheta"]) for r in matched}
+    z = median_polish_z(fleet)
+
+    flagged = sorted(
+        ((gpu, zz) for gpu, zz in z.items() if zz >= z_thresh),
+        key=lambda kv: -kv[1],
+    )
+
+    console.print(
+        f"[dim]scanned {len(matched)} GPUs across {len(nodes)} nodes "
+        f"at matched power (~{ref_p:.0f} W); {len(records) - len(matched)} off-band excluded[/dim]"
+        if powered else f"[dim]scanned {len(matched)} GPUs across {len(nodes)} nodes[/dim]"
+    )
+
+    t = Table(box=box.SIMPLE_HEAVY, show_header=True, title="Position-conditioned anomalies (median polish)")
+    t.add_column("GPU", style="bold")
+    t.add_column("robust-z", justify="right")
+    t.add_column("R_θ (C/W)", justify="right")
+    t.add_column("verdict")
+    rmap = {r["gpu"]: r for r in matched}
+    for gpu, zz in flagged:
+        color = "red" if zz >= 8 else "yellow"
+        verdict = "CRITICAL" if zz >= 8 else "anomaly"
+        t.add_row(gpu, f"[{color}]{zz:+.1f}[/]", f"{rmap[gpu]['rtheta']:.4f}", f"[{color}]{verdict}[/]")
+
+    if flagged:
+        console.print(t)
+        console.print(f"[bold]{len(flagged)}[/] unit(s) flagged at robust-z ≥ {z_thresh}.")
+    else:
+        console.print(f"[green]No units above robust-z {z_thresh}.[/] Fleet looks uniform after position correction.")
 
 
 # ── calibrate ─────────────────────────────────────────────────────────────────

@@ -68,6 +68,8 @@ GPU (pynvml)
 
 **Peer-relative fleet detection** — on a multi-GPU node, Theta also compares each GPU's `R_θ` to its **matched-power node-mates** (median + MAD robust-z, hardware-agnostic relative scale). This is cross-sectional, so unlike the temporal baseline it needs **no warm-up** and catches a unit that has been degraded since before the agent started. On real Princeton H100 telemetry (72 GPUs) this method blind-flagged 3 degraded units — one at robust-z +15.6, two invisible to temperature thresholds. It self-disables on hosts with fewer than 4 matched-power peers, so single-GPU setups never see a peer alert.
 
+**Position-conditioned cross-node scan (`theta fleet-scan`)** — across a *fleet* of nodes, HGX baseboard position imposes a thermal structure (±11% of mean R_θ on Della) that masks subtle degradation: a hot GPU in a structurally-cool slot can read below its node median yet be genuinely failing. `theta fleet-scan` pools R_θ across nodes and runs two-way (node × ordinal) **median polish** to remove that structure before scoring. On the real Princeton export it recovers **all 3** flagged units (the within-node detector alone finds 1) at zero false positives. It needs ≥2 nodes (a single node can't separate position from node effect); for a single host, `theta monitor`'s within-node peer detector is the right tool.
+
 **Classifier** — Decision Tree trained on 4,570 rows of Stage 1 Tesla T4 data. 100% 5-fold CV accuracy on steady-state samples. Rules are human-readable and publishable:
 
 ```
@@ -93,6 +95,7 @@ theta monitor --nb                  Use Naive Bayes instead of Decision Tree
 theta baseline --gpu 0              Lock virtual ambient T_ref from idle window
 theta baseline --gpu 0 --manual 24  Set T_ref manually (°C)
 theta classify                      Snapshot classify all GPUs right now
+theta fleet-scan export.json        Cross-node position-conditioned anomaly scan
 theta serve --port 9101             Metrics export only (no stdout alerts)
 theta train /path/data.csv          Retrain bundled models from new data
 ```
