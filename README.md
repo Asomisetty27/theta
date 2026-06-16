@@ -70,6 +70,8 @@ GPU (pynvml)
 
 **First-run trust + false-positive budget** — the agent earns trust on a stranger's fleet by being humble. Inferential alerts (anything derived from R_θ statistics — drift, peer, fault-curve, the unsupervised critic) are **held while a GPU is still warming up** ("learning your baseline, not yet confident"); ground-truth hardware faults (ECC, Xid, throttle) fire immediately. A **false-positive circuit breaker** watches the per-GPU alert rate — if it exceeds the budget, that means the thresholds are likely mis-calibrated for this hardware, so the agent goes quiet on that GPU and fires **one** meta-alert recommending `theta calibrate` instead of spraying wrong alarms. While a GPU has an active critical, concurrent lower-severity alerts for it are inhibited (Alertmanager-style). Readiness and suppression are exported (`theta_gpu_readiness`, `theta_alerts_suppressed_total`).
 
+**Per-job report card (`theta report`, SLURM/jobstats)** — jobstats already scrapes per-GPU temperature, power, and utilization into Prometheus, labelled by SLURM `jobid`, node, and HGX ordinal — it just never divides temp by power. `theta report <jobid>` pulls a job's telemetry from that same Prometheus and produces a per-job cooling-health card: per-GPU R_θ, the fleet mean, and any degraded units in two tiers (**flagged** = act, **watch** = elevated). No new agent, no new telemetry. On the real Princeton incident job it reproduces the E009 result — fleet mean R_θ 0.0603 C/W, j13g2:7 flagged at +14.2σ (81 °C) and j12g2:6 at +4.0σ (72 °C, invisible to a temperature threshold), with the marginal j13g2:2 on watch. Works live (`--prom <url> --start --end`) or against saved Prometheus exports (`--export <dir>`).
+
 **Position-conditioned cross-node scan (`theta fleet-scan`)** — across a *fleet* of nodes, HGX baseboard position imposes a thermal structure (±11% of mean R_θ on Della) that masks subtle degradation: a hot GPU in a structurally-cool slot can read below its node median yet be genuinely failing. `theta fleet-scan` pools R_θ across nodes and runs two-way (node × ordinal) **median polish** to remove that structure before scoring. On the real Princeton export it recovers **all 3** flagged units (the within-node detector alone finds 1) at zero false positives. It needs ≥2 nodes (a single node can't separate position from node effect); for a single host, `theta monitor`'s within-node peer detector is the right tool.
 
 **Classifier** — Decision Tree trained on 4,570 rows of Stage 1 Tesla T4 data. 100% 5-fold CV accuracy on steady-state samples. Rules are human-readable and publishable:
@@ -98,6 +100,7 @@ theta baseline --gpu 0              Lock virtual ambient T_ref from idle window
 theta baseline --gpu 0 --manual 24  Set T_ref manually (°C)
 theta classify                      Snapshot classify all GPUs right now
 theta fleet-scan export.json        Cross-node position-conditioned anomaly scan
+theta report <jobid> --prom <url>   Per-job R_θ report card (SLURM/jobstats)
 theta serve --port 9101             Metrics export only (no stdout alerts)
 theta train /path/data.csv          Retrain bundled models from new data
 ```

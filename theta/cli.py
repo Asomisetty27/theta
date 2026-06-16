@@ -9,6 +9,7 @@ Commands:
   calibrate   Measure hardware-specific R_theta thresholds (run once on non-T4 GPUs)
   classify    Single-snapshot classify all GPUs
   fleet-scan  Position-conditioned cross-node anomaly scan (the E009 method)
+  report      Per-job R_θ report card from Prometheus/jobstats (by SLURM job ID)
   serve       Run agent + Prometheus metrics server only
   train       Retrain bundled models from Stage 1 CSV
 """
@@ -482,6 +483,96 @@ def fleet_scan(
         console.print(f"[bold]{len(flagged)}[/] unit(s) flagged at robust-z ≥ {z_thresh}.")
     else:
         console.print(f"[green]No units above robust-z {z_thresh}.[/] Fleet looks uniform after position correction.")
+
+
+# ── report (SLURM/jobstats per-job R_θ) ───────────────────────────────────────
+
+@app.command()
+def report(
+    jobid:    str = typer.Argument(..., help="SLURM job ID (live) or a label (export mode)"),
+    prom:     Optional[str] = typer.Option(None, "--prom", help="Prometheus base URL (live mode)"),
+    start:    Optional[float] = typer.Option(None, "--start", help="Range start (unix sec, live mode)"),
+    end:      Optional[float] = typer.Option(None, "--end", help="Range end (unix sec, live mode)"),
+    export:   Optional[str] = typer.Option(None, "--export", help="Dir of Prometheus query_range JSON (offline mode)"),
+    ambient:  float = typer.Option(25.0, "--ambient", help="Assumed inlet °C (affects magnitudes only; detection is peer-relative)"),
+    z_thresh: float = typer.Option(3.0, "--z", help="Robust-z to flag a unit"),
+):
+    """
+    Per-job R_θ report card — the SLURM/jobstats integration.
+
+    Pulls a job's GPU temp/power/util (the metrics jobstats already scrapes into
+    Prometheus) and reports per-job cooling health: per-GPU R_θ, peer comparison,
+    and any cooling-degraded units — flagged (act) and watch (elevated). Runs the
+    validated E009 detection (peer-relative within a node; position-conditioned
+    median polish across ≥2 nodes).
+
+      theta report 6982217 --prom http://prometheus:9090 --start 1777147080 --end 1777159000
+      theta report 6982217 --export /path/to/prometheus_json_dir
+    """
+    from .agent.jobreport import load_exports, load_prometheus, steady_rtheta, build_report
+
+    if export:
+        d = Path(export)
+        files = sorted(d.glob("*.json")) if d.is_dir() else [d]
+        if not files:
+            console.print(f"[red]no JSON exports found under[/] {export}")
+            raise typer.Exit(2)
+        aligned = load_exports(files)
+    elif prom:
+        if start is None or end is None:
+            console.print("[red]--start and --end (unix seconds) are required in live mode[/]")
+            raise typer.Exit(2)
+        try:
+            aligned = load_prometheus(prom, jobid, start, end)
+        except Exception as e:  # network / query errors
+            console.print(f"[red]Prometheus query failed:[/] {e}")
+            raise typer.Exit(2)
+    else:
+        console.print("[red]provide either --export <dir> or --prom <url> --start --end[/]")
+        raise typer.Exit(2)
+
+    stats = steady_rtheta(aligned, ambient=ambient)
+    rep = build_report(jobid, stats, z_thresh=z_thresh)
+
+    console.print()
+    console.print(f"[bold]Theta job report[/] · job [bold cyan]{rep.jobid}[/] · "
+                  f"{len(rep.gpus)} GPUs · {len(rep.nodes)} node(s) · method=[dim]{rep.method}[/]")
+    if rep.fleet_mean_r is not None:
+        console.print(f"[dim]fleet mean steady-load R_θ = {rep.fleet_mean_r:.4f} C/W[/]")
+    for n in rep.notes:
+        console.print(f"[dim]note: {n}[/dim]")
+
+    if not rep.gpus:
+        console.print("[yellow]No steady-load samples — job may be too short or idle.[/]")
+        raise typer.Exit(1)
+
+    t = Table(box=box.SIMPLE_HEAVY, show_header=True)
+    t.add_column("GPU", style="bold")
+    t.add_column("R_θ (C/W)", justify="right")
+    t.add_column("T̄ (°C)", justify="right")
+    t.add_column("P̄ (W)", justify="right")
+    t.add_column("robust-z", justify="right")
+    t.add_column("status")
+    for s in sorted(rep.gpus, key=lambda g: (g.node, g.ordinal)):
+        z = rep.flagged.get(s.key, rep.watch.get(s.key))
+        if s.key in rep.flagged:
+            color, status = ("red", "FLAGGED")
+        elif s.key in rep.watch:
+            color, status = ("yellow", "watch")
+        else:
+            color, status = ("green", "ok")
+        zs = f"[{color}]{z:+.1f}[/]" if z is not None else "[dim]—[/]"
+        t.add_row(s.key, f"{s.r_mean:.4f}", f"{s.t_mean:.0f}",
+                  f"{s.p_mean:.0f}", zs, f"[{color}]{status}[/]")
+    console.print(t)
+
+    if rep.flagged:
+        console.print(f"[bold red]{len(rep.flagged)}[/] unit(s) flagged (robust-z ≥ {z_thresh}) — "
+                      f"cooling-degraded relative to peers at matched power.")
+    if rep.watch:
+        console.print(f"[yellow]{len(rep.watch)}[/] unit(s) on watch (elevated, sub-threshold).")
+    if not rep.flagged and not rep.watch:
+        console.print("[green]All GPUs nominal — no peer-relative cooling anomalies.[/]")
 
 
 # ── calibrate ─────────────────────────────────────────────────────────────────

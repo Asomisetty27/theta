@@ -1,0 +1,69 @@
+# Theta R_θ recording rules for a jobstats / nvidia_gpu_exporter Prometheus.
+#
+# Drop this into your Prometheus rule_files and R_θ becomes a first-class series
+# alongside the metrics jobstats already scrapes — no Theta agent required, no new
+# telemetry. The CLI (`theta report`) computes the same thing on demand with the
+# full peer-relative / median-polish detection; these rules give you the raw signal
+# continuously, for Grafana panels and Alertmanager.
+#
+# Assumes the standard nvidia_gpu_exporter metric set:
+#   nvidia_gpu_temperature_celsius      {instance, ordinal, jobid, uuid, ...}
+#   nvidia_gpu_power_usage_milliwatts   {instance, ordinal, jobid, uuid, ...}
+#   nvidia_gpu_duty_cycle               (utilization %)
+#
+# T_reference: there is usually no inlet sensor, so we assume a fixed ambient
+# (edit T_REF below to your facility inlet, or wire a real inlet series). All of
+# Theta's *detection* is peer-relative, so this constant cancels there; it only
+# scales the absolute R_θ magnitude shown on a panel. See Q_ambient_measurement.
+
+groups:
+  - name: theta_rtheta
+    interval: 30s
+    rules:
+      # Effective thermal resistance R_θ = (T_junction − T_ref) / P_GPU  [°C/W].
+      # Power is milliwatts → divide by 1000 for watts. Guard the low-power region
+      # (P < 100 W) where R_θ is numerically unstable and T_ref-sensitive (F2).
+      - record: theta:gpu_rtheta:cwatt
+        expr: |
+          (nvidia_gpu_temperature_celsius - 25)
+          /
+          (nvidia_gpu_power_usage_milliwatts / 1000 > 100)
+
+      # Per-node peer median R_θ at matched (high) load — the "healthy" reference
+      # each GPU should sit near. Compare a GPU to this to spot cooling drift.
+      - record: theta:gpu_rtheta_node_median:cwatt
+        expr: |
+          quantile by (instance) (0.5,
+            theta:gpu_rtheta:cwatt
+            and on (instance, ordinal)
+            (nvidia_gpu_power_usage_milliwatts / 1000 > 400)
+          )
+
+      # Per-GPU deviation from its node-mates, as a fraction (e.g. 0.30 = +30%).
+      # A sustained positive value at steady power = cooling degradation. Alert on
+      # this, not on absolute temperature.
+      - record: theta:gpu_rtheta_peer_dev:ratio
+        expr: |
+          (
+            theta:gpu_rtheta:cwatt
+            - on (instance) group_left() theta:gpu_rtheta_node_median:cwatt
+          )
+          / on (instance) group_left() theta:gpu_rtheta_node_median:cwatt
+
+  - name: theta_rtheta_alerts
+    rules:
+      # Peer-relative cooling-degradation alert. Fires when a GPU runs ≥35% above
+      # its node-mates' R_θ for 15 minutes under load — the cross-sectional signal
+      # E009 validated, expressed as a sustained PromQL rule.
+      - alert: ThetaGpuCoolingDegraded
+        expr: theta:gpu_rtheta_peer_dev:ratio > 0.35
+        for: 15m
+        labels:
+          severity: warning
+          source: theta
+        annotations:
+          summary: "GPU {{ $labels.instance }} ordinal {{ $labels.ordinal }} cooling degraded"
+          description: >
+            R_θ is {{ $value | humanizePercentage }} above its node-mates at matched
+            power for 15m — cooling-path degradation independent of workload.
+            Run `theta report {{ $labels.jobid }}` for the full per-job analysis.
