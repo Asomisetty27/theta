@@ -88,79 +88,30 @@ def _nvml_available() -> bool:
 
 
 def _rocm_available() -> bool:
-    """Is rocm_smi_lib (or pyrsmi) importable AND able to talk to a driver?"""
+    """Is amdsmi importable AND able to talk to a driver?"""
     try:
-        # The two main ROCm Python bindings. Either is acceptable.
-        try:
-            import pyrsmi  # noqa: F401
-            return True
-        except ImportError:
-            pass
-        # rocm_smi_lib is sometimes installed as `rsmiBindings`
-        import rsmiBindings  # noqa: F401
-        return True
+        import amdsmi
     except ImportError:
+        return False
+    try:
+        amdsmi.amdsmi_init()
+        try:
+            return len(amdsmi.amdsmi_get_processor_handles()) > 0
+        finally:
+            try:
+                amdsmi.amdsmi_shut_down()
+            except Exception:
+                pass
+    except Exception:
         return False
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# AMD ROCm collector — stub until the real implementation lands
+# AMD ROCm collector — real implementation in rocm_collector.py
 # ──────────────────────────────────────────────────────────────────────────
-
-class ROCmCollector:
-    """Stub AMD MI300/MI325 collector — architecture only, not functional yet.
-
-    The shape is intentionally identical to NVMLCollector so the daemon can
-    select between them. When the real implementation lands, every method
-    body fills in, no surrounding code changes.
-
-    Why ship the stub: it pins the interface contract today. When AMD lands
-    (Cal Poly EE has MI300X access on the roadmap), the implementer knows
-    exactly what surface to deliver — including the rocm_smi_lib calls that
-    map to each NVML query.
-    """
-
-    vendor = "amd"
-
-    def __init__(self, config):
-        self._config = config
-        self._initialized = False
-
-    async def __aenter__(self) -> "ROCmCollector":
-        # Real impl: rocm_smi.rsmi_init(0) and discover devices
-        raise NotImplementedError(
-            "AMD ROCm collector is stubbed but not yet implemented. "
-            "To enable, install pyrsmi and complete rocm_smi calls in "
-            "ROCmCollector.__aenter__ / collect_all. Reference mapping "
-            "from NVML to ROCm SMI is in the docstring."
-        )
-
-    async def __aexit__(self, *_) -> None:
-        pass
-
-    async def collect_all(self) -> list[RawSample]:
-        # NVML → ROCm SMI mapping reference for the future implementer:
-        #   nvmlDeviceGetTemperature(handle, NVML_TEMPERATURE_GPU)
-        #     → rsmi_dev_temp_metric_get(dev, sensor, RSMI_TEMP_CURRENT)
-        #   nvmlDeviceGetPowerUsage(handle)
-        #     → rsmi_dev_power_ave_get(dev) (microwatts)
-        #   nvmlDeviceGetUtilizationRates(handle).gpu
-        #     → rsmi_dev_busy_percent_get(dev)
-        #   nvmlDeviceGetClockInfo(handle, NVML_CLOCK_SM)
-        #     → rsmi_dev_gpu_clk_freq_get(dev, RSMI_CLK_TYPE_SYS, ...)
-        #   nvmlDeviceGetTotalEccErrors(handle, single|double, volatile)
-        #     → rsmi_dev_ecc_count_get(dev, RSMI_GPU_BLOCK_*, ec_counter)
-        #   nvmlDeviceGetCurrentClocksThrottleReasons(handle)
-        #     → rsmi_dev_perf_level_get + rsmi_dev_volt_metric_get
-        return []
-
-    @property
-    def gpu_count(self) -> int:
-        return 0
-
-    @property
-    def gpu_names(self) -> list[str]:
-        return []
+# (Imported lazily inside select_collector so NVIDIA-only hosts never import
+# amdsmi. Implemented against amdsmi; hardware-validation on real MI300 silicon
+# is the open item — see rocm_collector.py module docstring.)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -182,10 +133,14 @@ def select_collector(config, *, prefer: str | None = None):
     # Lazy imports to avoid pulling pynvml on AMD-only hosts and vice versa
     from .collector import NVMLCollector
 
+    def _rocm():
+        from .rocm_collector import ROCmCollector
+        return ROCmCollector(config)
+
     if prefer == "nvidia":
         return NVMLCollector(config)
     if prefer == "amd":
-        return ROCmCollector(config)
+        return _rocm()
     if prefer == "demo":
         # NVMLCollector's demo mode is the canonical fake-data source
         coll = NVMLCollector(config)
@@ -196,6 +151,6 @@ def select_collector(config, *, prefer: str | None = None):
     if _nvml_available():
         return NVMLCollector(config)
     if _rocm_available():
-        return ROCmCollector(config)
+        return _rocm()
     # Fall back to demo mode
     return NVMLCollector(config)
