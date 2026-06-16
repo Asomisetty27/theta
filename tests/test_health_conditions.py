@@ -156,3 +156,14 @@ def test_conditions_endpoint_serves_tracker():
         assert g0["status"] == "healthy"
     finally:
         server.stop()
+
+
+def test_telemetry_unavailable_is_unknown_but_schedulable():
+    tr = HealthConditionTracker()
+    tr.observe(0, ts=100, warming=False, state=GPUState.UNKNOWN, telemetry_unavailable=True)
+    h = tr.health(0)
+    assert h.status is HealthStatus.UNKNOWN
+    assert h.schedulable is True                 # don't drain a vGPU we just can't read
+    assert any(c.name == "TelemetryUnavailable" for c in h.conditions)
+    # and it does NOT spuriously add cooling conditions
+    assert all(c.name == "TelemetryUnavailable" for c in h.conditions)

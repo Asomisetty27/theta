@@ -52,9 +52,15 @@ class NVMLCollector:
         self._n_gpus: int    = 0
         self._demo_mode: bool = not NVML_AVAILABLE
         self._gpu_names: list[str] = []  # populated in _init_nvml
+        self._caps: list = []            # DeviceCapability per slot (MIG/vGPU), set in _init_nvml
         # Per-slot failure tracking for self-healing handle reinit
         self._failure_counts: dict[int, int] = {}
         self._failure_threshold: int = 3  # consecutive misses before reinit
+
+    @property
+    def capabilities(self) -> list:
+        """HAL: per-slot DeviceCapability (MIG/vGPU mode, R_θ computability)."""
+        return list(self._caps)
 
     @property
     def gpu_count(self) -> int:
@@ -110,6 +116,25 @@ class NVMLCollector:
             except Exception:
                 names.append("unknown")
         self._gpu_names = names
+
+        # Probe MIG/vGPU capabilities per device so downstream knows whether R_θ
+        # is computable and what it means (per-physical-die under MIG, possibly
+        # unavailable under vGPU). Best-effort; never fails init.
+        from .device_caps import probe_capability, DeviceMode
+        self._caps = []
+        for slot, h in enumerate(self._handles):
+            try:
+                cap = probe_capability(pynvml, h)
+            except Exception:
+                from .device_caps import DeviceCapability
+                cap = DeviceCapability(DeviceMode.UNKNOWN, True, True, True,
+                                       "capability probe failed — assuming physical")
+            self._caps.append(cap)
+            if cap.mode is not DeviceMode.PHYSICAL or not cap.rtheta_computable:
+                log.warning("device_capability", slot=slot,
+                            name=names[slot] if slot < len(names) else "?",
+                            mode=cap.mode.value, rtheta_computable=cap.rtheta_computable,
+                            note=cap.note)
         log.info("NVML initialized", extra={"n_gpus": len(self._handles)})
 
     def _shutdown_nvml(self) -> None:

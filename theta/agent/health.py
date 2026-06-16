@@ -43,7 +43,11 @@ class HealthStatus(str, Enum):
 # and set status=CRITICAL; WARNING conditions set status=DEGRADED.
 CRITICAL_CONDITIONS = {"CoolingCritical", "EccErrors", "ZombieContext"}
 WARNING_CONDITIONS  = {"CoolingDegraded", "Throttling", "TelemetryStale"}
-ALL_CONDITIONS      = sorted(CRITICAL_CONDITIONS | WARNING_CONDITIONS)
+# Info conditions surface a fact but do NOT degrade status or schedulability.
+# TelemetryUnavailable (vGPU guest with no temp/power) means "can't assess" — the
+# GPU may be perfectly fine; don't drain a fleet because we can't read it.
+INFO_CONDITIONS     = {"TelemetryUnavailable"}
+ALL_CONDITIONS      = sorted(CRITICAL_CONDITIONS | WARNING_CONDITIONS | INFO_CONDITIONS)
 
 
 @dataclass
@@ -123,10 +127,24 @@ class HealthConditionTracker:
         throttling: bool = False,
         ecc_dbit: int = 0,
         telemetry_stale: bool = False,
+        telemetry_unavailable: bool = False,
     ) -> None:
         g = self._g(gpu)
         g.observed = True
 
+        # Telemetry unavailable (vGPU guest): we cannot assess this GPU. Surface
+        # the fact, hold status at UNKNOWN, keep it schedulable — and skip the
+        # R_θ-derived conditions, which would be meaningless without temp/power.
+        if telemetry_unavailable:
+            for n in ALL_CONDITIONS:
+                self._set(g, n, n == "TelemetryUnavailable", ts,
+                          "vgpu_no_telemetry", "vGPU guest — temperature/power not exposed; cannot assess")
+            if g.status is not HealthStatus.UNKNOWN:
+                g.status = HealthStatus.UNKNOWN
+                g.status_since = ts
+            return
+
+        self._set(g, "TelemetryUnavailable", False, ts)
         cooling_critical = drift_critical or peer_critical or state == GPUState.CRITICAL
         cooling_degraded = (drift_warning or peer_flagged or state == GPUState.DRIFTING) \
             and not cooling_critical

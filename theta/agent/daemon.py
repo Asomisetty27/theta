@@ -162,6 +162,8 @@ class ThetaAgent:
         self._health_conditions = HealthConditionTracker()
         self._peer_flag:      dict[int, tuple[bool, bool]] = {}   # gpu → (flagged, critical)
         self._telemetry_stale: set[int] = set()                  # gpus with stale telemetry
+        self._device_caps:    dict[int, object] = {}             # gpu → DeviceCapability (MIG/vGPU)
+        self._no_rtheta:      set[int] = set()                   # gpus where R_θ is uncomputable
         self._statemachine   = GPUStateMachine()
         self._correlator     = FleetCorrelator()
         self._ecc_monitor    = EccMonitor()
@@ -448,6 +450,7 @@ class ThetaAgent:
             peer_flagged=_peer_flag, peer_critical=_peer_crit,
             throttling=_throttle_now, ecc_dbit=getattr(raw_sample, "ecc_dbit", 0) or 0,
             telemetry_stale=gpu in self._telemetry_stale,
+            telemetry_unavailable=gpu in self._no_rtheta,
         )
         self._exporter.update_health(gpu, self._health_conditions.health(gpu))
 
@@ -1071,6 +1074,24 @@ class ThetaAgent:
                 }
             except Exception:
                 self._collector_gpu_names = {}
+
+            # MIG/vGPU capabilities: which GPUs can yield a valid R_θ, and what it
+            # means (per-physical-die under MIG, possibly unavailable under vGPU).
+            try:
+                caps = collector.capabilities
+            except Exception:
+                caps = []
+            self._device_caps = {i: c for i, c in enumerate(caps)}
+            self._no_rtheta = {i for i, c in self._device_caps.items()
+                               if not getattr(c, "rtheta_computable", True)}
+            _modes = {}
+            for c in self._device_caps.values():
+                m = getattr(c, "mode", None)
+                key = m.value if m is not None else "unknown"
+                _modes[key] = _modes.get(key, 0) + 1
+            if _modes:
+                log.info("device_modes", **_modes,
+                         rtheta_unavailable=len(self._no_rtheta))
 
             # Register each GPU with the classifier so it picks the right
             # threshold tier from hw_profiles instead of falling back to T4
