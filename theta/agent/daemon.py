@@ -46,7 +46,8 @@ from .telemetry          import TelemetryReporter
 from .predictor          import FailurePredictor
 from .sdc_hunter         import SDCHunter
 from .redfish_collector  import RedfishEnricher
-from .alerter            import AlertRouter, StdoutAlerter, WebhookAlerter, FileAlerter
+from .alerter            import (AlertRouter, StdoutAlerter, WebhookAlerter, FileAlerter,
+                                 PagerDutyAlerter, OpsgenieAlerter)
 from .health_api         import HealthAPIServer
 from .fault_classifier   import FaultCurveClassifier, FaultCause
 from .profile_learner    import ProfileLearner
@@ -88,6 +89,9 @@ class AgentConfig:
     # Alerting
     webhook_url:        Optional[str]  = None
     alert_log_path:     Optional[str]  = None
+    pagerduty_key:      Optional[str]  = None   # PagerDuty Events API v2 routing key
+    opsgenie_key:       Optional[str]  = None   # Opsgenie API integration key (GenieKey)
+    opsgenie_region:    str            = "us"   # "us" | "eu"
     quiet:              bool  = False
 
     # Prometheus
@@ -243,6 +247,11 @@ class ThetaAgent:
             router.add(StdoutAlerter())
         if self.config.webhook_url:
             router.add(WebhookAlerter(self.config.webhook_url))
+        if self.config.pagerduty_key:
+            router.add(PagerDutyAlerter(self.config.pagerduty_key))
+        if self.config.opsgenie_key:
+            router.add(OpsgenieAlerter(self.config.opsgenie_key,
+                                       region=self.config.opsgenie_region))
         if self.config.alert_log_path:
             router.add(FileAlerter(self.config.alert_log_path))
         return router

@@ -95,6 +95,8 @@ theta monitor                       Run agent — blocks until Ctrl+C
 theta monitor --interval 2          Sample every 2s
 theta monitor --gpus 0,1,3          Monitor specific GPUs
 theta monitor --webhook <url>       Send alerts to Slack / generic webhook
+theta monitor --pagerduty <key>     Route alerts to PagerDuty (Events API v2)
+theta monitor --opsgenie <key>      Route alerts to Opsgenie (Alert API)
 theta monitor --log alerts.jsonl    Append alerts to JSONL file
 theta monitor --port 9101           Prometheus metrics port (0 = disabled)
 theta monitor --nb                  Use Naive Bayes instead of Decision Tree

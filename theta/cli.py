@@ -232,6 +232,8 @@ def monitor(
     interval:    Optional[float] = typer.Option(None, "--interval",   "-i",  help="Sample interval seconds [default: 5.0 or saved config]"),
     gpus:        Optional[str]   = typer.Option(None, "--gpus",       "-g",  help="GPU indices (comma-sep) or 'all' [default: saved config or all]"),
     webhook:     Optional[str]   = typer.Option(None, "--webhook",    "-w",  help="Alert webhook URL [default: saved config or none]"),
+    pagerduty:   Optional[str]   = typer.Option(None, "--pagerduty",         help="PagerDuty Events API v2 routing key"),
+    opsgenie:    Optional[str]   = typer.Option(None, "--opsgenie",          help="Opsgenie API integration key (GenieKey)"),
     log_file:    Optional[str]   = typer.Option(None, "--log",                help="JSONL alert log file [default: saved config or none]"),
     port:        Optional[int]   = typer.Option(None, "--port",       "-p",  help="Prometheus port; 0 disables [default: saved config or 9101]"),
     quiet:       bool            = typer.Option(False, "--quiet",     "-q",  help="Suppress stdout alerts"),
@@ -250,6 +252,8 @@ def monitor(
         ",".join(str(i) for i in saved["gpu_indices"]) if saved.get("gpu_indices") else "all"
     )
     webhook_v    = webhook  if webhook  is not None else saved.get("webhook_url")
+    pagerduty_v  = pagerduty if pagerduty is not None else saved.get("pagerduty_key")
+    opsgenie_v   = opsgenie  if opsgenie  is not None else saved.get("opsgenie_key")
     log_file_v   = log_file if log_file is not None else saved.get("alert_log_path")
     port_v       = port     if port     is not None else (
         saved.get("prometheus_port", 9101) if saved.get("enable_prometheus", True) else 0
@@ -261,6 +265,9 @@ def monitor(
         interval_sec      = interval_v,
         gpu_indices       = gpu_list,
         webhook_url       = webhook_v,
+        pagerduty_key     = pagerduty_v,
+        opsgenie_key      = opsgenie_v,
+        opsgenie_region   = saved.get("opsgenie_region", "us"),
         alert_log_path    = log_file_v,
         prometheus_port   = port_v,
         enable_prometheus = port_v > 0,
