@@ -68,6 +68,8 @@ GPU (pynvml)
 
 **Peer-relative fleet detection** — on a multi-GPU node, Theta also compares each GPU's `R_θ` to its **matched-power node-mates** (median + MAD robust-z, hardware-agnostic relative scale). This is cross-sectional, so unlike the temporal baseline it needs **no warm-up** and catches a unit that has been degraded since before the agent started. On real Princeton H100 telemetry (72 GPUs) this method blind-flagged 3 degraded units — one at robust-z +15.6, two invisible to temperature thresholds. It self-disables on hosts with fewer than 4 matched-power peers, so single-GPU setups never see a peer alert.
 
+**First-run trust + false-positive budget** — the agent earns trust on a stranger's fleet by being humble. Inferential alerts (anything derived from R_θ statistics — drift, peer, fault-curve, the unsupervised critic) are **held while a GPU is still warming up** ("learning your baseline, not yet confident"); ground-truth hardware faults (ECC, Xid, throttle) fire immediately. A **false-positive circuit breaker** watches the per-GPU alert rate — if it exceeds the budget, that means the thresholds are likely mis-calibrated for this hardware, so the agent goes quiet on that GPU and fires **one** meta-alert recommending `theta calibrate` instead of spraying wrong alarms. While a GPU has an active critical, concurrent lower-severity alerts for it are inhibited (Alertmanager-style). Readiness and suppression are exported (`theta_gpu_readiness`, `theta_alerts_suppressed_total`).
+
 **Position-conditioned cross-node scan (`theta fleet-scan`)** — across a *fleet* of nodes, HGX baseboard position imposes a thermal structure (±11% of mean R_θ on Della) that masks subtle degradation: a hot GPU in a structurally-cool slot can read below its node median yet be genuinely failing. `theta fleet-scan` pools R_θ across nodes and runs two-way (node × ordinal) **median polish** to remove that structure before scoring. On the real Princeton export it recovers **all 3** flagged units (the within-node detector alone finds 1) at zero false positives. It needs ≥2 nodes (a single node can't separate position from node effect); for a single host, `theta monitor`'s within-node peer detector is the right tool.
 
 **Classifier** — Decision Tree trained on 4,570 rows of Stage 1 Tesla T4 data. 100% 5-fold CV accuracy on steady-state samples. Rules are human-readable and publishable:
@@ -116,6 +118,8 @@ theta train /path/data.csv          Retrain bundled models from new data
 | `theta_gpu_baseline_tref_celsius` | gauge | Virtual ambient T_ref |
 | `theta_gpu_window_rtheta_std` | gauge | Steady-state window σ |
 | `theta_gpu_alerts_total` | counter | Alerts (labels: `severity`, `state`) |
+| `theta_gpu_readiness` | gauge | 1 = confident, 0 = warming or FP-breaker tripped |
+| `theta_alerts_suppressed_total` | counter | Inferential alerts withheld by the governor (label: `reason`) |
 
 All metrics include a `gpu_index` label.
 

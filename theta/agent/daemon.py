@@ -35,6 +35,7 @@ from .classifier import StateClassifier
 from .calibrate  import CalibrationManager
 from .detector   import DriftDetector
 from .peer       import PeerRelativeDetector
+from .governor    import AlertGovernor, Action
 from .state      import GPUStateMachine
 from .correlator import FleetCorrelator
 from .silicon         import EccMonitor, MicroThrottleDetector, XIDParser
@@ -52,6 +53,18 @@ from ..                  import __version__
 from .exporter   import PrometheusExporter
 
 log = structlog.get_logger(__name__)
+
+
+def _tag_detector(event, name: str) -> None:
+    """Mark an alert as inferential so the AlertGovernor governs it (warming /
+    inhibition / FP-budget). Alerts without a detector tag are treated as
+    ground-truth hardware facts and bypass the governor."""
+    try:
+        if event.context is None:
+            event.context = {}
+        event.context.setdefault("detector", name)
+    except AttributeError:
+        pass
 
 
 @dataclass
@@ -136,6 +149,10 @@ class ThetaAgent:
         self._peer         = PeerRelativeDetector()
         self._gpu_rtheta:   dict[int, float] = {}   # latest valid R_θ per GPU (fleet snapshot)
         self._peer_alerted: dict[int, float] = {}   # gpu → last peer-alert ts (cooldown)
+        # First-run-trust + FP-budget layer. Every alert funnels through _emit(),
+        # which gates inferential alerts through this governor (warming / inhibition
+        # / budget breaker). Ground-truth hardware faults bypass it. See governor.py.
+        self._governor     = AlertGovernor()
         self._statemachine   = GPUStateMachine()
         self._correlator     = FleetCorrelator()
         self._ecc_monitor    = EccMonitor()
@@ -262,9 +279,7 @@ class ThetaAgent:
             for xid_gpu, xid, xid_count in self._xid_parser.poll(ts):
                 xid_alert = self._xid_parser.make_alert(xid_gpu, xid, xid_count, ts)
                 if xid_alert:
-                    self._alert_count += 1
-                    self._exporter.record_alert(xid_alert)
-                    await self._router.route(xid_alert)
+                    await self._emit(xid_alert)   # ground-truth — bypasses governor
                     log.warning("xid_event", gpu=xid_gpu, xid=xid, category=xid_alert.context.get("xid_category"))
 
         # ── Poll latency tracking (monitoring pipeline observability) ─────────
@@ -299,9 +314,7 @@ class ThetaAgent:
                         context={"severity": "warning", "poll_latency_ms": round(new_ema*1000, 2),
                                  "baseline_ms": round(baseline_lat*1000, 2)},
                     )
-                    self._alert_count += 1
-                    self._exporter.record_alert(lat_alert)
-                    await self._router.route(lat_alert)
+                    await self._emit(lat_alert)   # ground-truth (agent-health)
 
         # 0a. DCGM enrichment — fills NVLink/PCIe/engine fields if nv-hostengine available
         with self._stage("dcgm_enrich", gpu):
@@ -315,9 +328,7 @@ class ThetaAgent:
                 self._micro_throttle.update(raw_sample),
             ):
                 if silicon_alert is not None:
-                    self._alert_count += 1
-                    self._exporter.record_alert(silicon_alert)
-                    await self._router.route(silicon_alert)
+                    await self._emit(silicon_alert)   # ground-truth — ECC/throttle facts
 
         # 1. Update virtual ambient — hard lock on first idle window,
         #    soft exponential-smoothing update during long-run transient idles.
@@ -404,6 +415,11 @@ class ThetaAgent:
         if window.rtheta_mean is not None and math.isfinite(window.rtheta_mean):
             self._gpu_rtheta[gpu] = window.rtheta_mean
 
+        # Feed the governor this GPU's readiness: "confident" once the drift
+        # detector has an established baseline. Gates first-run alert holding.
+        self._governor.note_cycle(gpu, ready=self._detector.get_baseline(gpu) is not None, ts=ts)
+        self._exporter.update_readiness(gpu, self._governor.readiness(gpu))
+
         with self._stage("critic", gpu):
             # Feed healthy windows to the Isolation Forest baseline
             healthy = state in (GPUState.CLEAN_IDLE, GPUState.UNDER_LOAD)
@@ -413,9 +429,8 @@ class ThetaAgent:
             # Score and check for critic/supervised disagreement
             critic_alert = self._critic.maybe_alert(gpu, window, state, ts)
             if critic_alert is not None:
-                self._alert_count += 1
-                self._exporter.record_alert(critic_alert)
-                await self._router.route(critic_alert)
+                _tag_detector(critic_alert, "critic")   # inferential — governed
+                await self._emit(critic_alert)
                 # Track disagreement for model drift monitoring
                 self._critic_disagree[gpu] = self._critic_disagree.get(gpu, 0) + 1
             self._critic_total[gpu] = self._critic_total.get(gpu, 0) + 1
@@ -474,6 +489,7 @@ class ThetaAgent:
                         ),
                         context         = {
                             "severity":    "warning",
+                            "detector":    "fault_curve",   # inferential — governed
                             "fault_cause": fault.cause.value,
                             "confidence":  fault.confidence,
                             "intercept":   fault.intercept,
@@ -485,9 +501,7 @@ class ThetaAgent:
                             **fault.evidence,
                         },
                     )
-                    self._alert_count += 1
-                    self._exporter.record_alert(fault_alert)
-                    await self._router.route(fault_alert)
+                    await self._emit(fault_alert)
                     log.info("fault_classified",
                              gpu=gpu,
                              cause=fault.cause.value,
@@ -499,9 +513,11 @@ class ThetaAgent:
         alert = self._statemachine.transition(classified, drift)
 
         if alert is not None:
-            self._alert_count += 1
-            self._exporter.record_alert(alert)
-            await self._router.route(alert)
+            # Drift/state-transition alerts are inferential (R_θ-statistics-derived)
+            # → governed by warming/inhibition/budget. The classified-healthy
+            # transitions carry no anomaly but go through the same choke point.
+            _tag_detector(alert, "drift")
+            await self._emit(alert)
 
             # Explainability: log the classifier's reasoning for every anomalous alert
             if alert.state not in (GPUState.CLEAN_IDLE, GPUState.UNDER_LOAD):
@@ -874,6 +890,33 @@ class ThetaAgent:
         else:
             log.info("config_reloaded", changes="no_op_no_changes_detected")
 
+    async def _emit(self, event: "AlertEvent") -> None:
+        """Single choke point for every alert.
+
+        Gates the event through the AlertGovernor (first-run warming, severity
+        inhibition, FP-budget breaker — inferential alerts only; ground-truth
+        hardware faults bypass), then records + routes anything that survives.
+        A breaker-trip meta-alert, if produced, is always routed. Replaces the
+        previously copy-pasted `_alert_count / record_alert / route` blocks so
+        all alert policy lives in one place.
+        """
+        decision = self._governor.evaluate(event, event.timestamp)
+        if decision.meta_alert is not None:
+            self._alert_count += 1
+            self._exporter.record_alert(decision.meta_alert)
+            await self._router.route(decision.meta_alert)
+            log.warning("fp_breaker_tripped", gpu=event.gpu_index,
+                        reason=decision.reason)
+        if decision.action is Action.ROUTE:
+            self._alert_count += 1
+            self._exporter.record_alert(event)
+            await self._router.route(event)
+        else:
+            self._suppressed_count = getattr(self, "_suppressed_count", 0) + 1
+            self._exporter.record_suppressed(event.gpu_index, decision.action.name)
+            log.debug("alert_suppressed", gpu=event.gpu_index,
+                      action=decision.action.name, reason=decision.reason)
+
     # Peer alerts are deliberately rare (a degraded GPU stays degraded), so one
     # alert per GPU per cooldown is plenty and keeps the false-positive budget
     # — and the operator's inbox — quiet.
@@ -932,9 +975,7 @@ class ThetaAgent:
                     "pct_above_peers": round(pct, 1),
                 },
             )
-            self._alert_count += 1
-            self._exporter.record_alert(alert)
-            await self._router.route(alert)
+            await self._emit(alert)
 
     async def run(self) -> None:
         """Main loop. Blocks until shutdown signal received."""
@@ -977,6 +1018,8 @@ class ThetaAgent:
             interval=self.config.interval_sec,
             classifier=self._classifier.mode,
             prometheus_port=self.config.prometheus_port if self.config.enable_prometheus else None,
+            trust_posture="warming",   # inferential alerts held until baselines establish
+            fp_budget=self._governor._budget_count,
         )
 
         # Select the appropriate collector for this host's hardware (HAL).

@@ -127,6 +127,14 @@ class PrometheusExporter:
                                     "Total alerts emitted",
                                     ["gpu_index", "severity", "state"])
 
+        # First-run-trust / FP-budget governor observability
+        self.g_readiness  = Gauge("theta_gpu_readiness",
+                                  "Detector confidence: 1=confident, 0=warming or FP-breaker tripped",
+                                  ["gpu_index"])
+        self.c_suppressed = Counter("theta_alerts_suppressed_total",
+                                    "Inferential alerts withheld by the governor",
+                                    ["gpu_index", "reason"])
+
         # Build info
         try:
             self.i_build = Info("theta_build", "Theta agent build info")
@@ -212,6 +220,16 @@ class PrometheusExporter:
         self.c_alerts.labels(str(event.gpu_index), severity, state).inc()
         if isinstance(ctx, dict) and ctx.get("sdc_detected"):
             self.c_sdc.labels(str(event.gpu_index)).inc()
+
+    def update_readiness(self, gpu_index: int, readiness: float) -> None:
+        if not PROMETHEUS_AVAILABLE:
+            return
+        self.g_readiness.labels(str(gpu_index)).set(readiness)
+
+    def record_suppressed(self, gpu_index: int, reason: str) -> None:
+        if not PROMETHEUS_AVAILABLE:
+            return
+        self.c_suppressed.labels(str(gpu_index), reason).inc()
 
     def update_fault_diagnosis(self, diagnosis: FaultDiagnosis) -> None:
         if not PROMETHEUS_AVAILABLE:
