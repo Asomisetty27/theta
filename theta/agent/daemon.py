@@ -53,6 +53,7 @@ from .fault_classifier   import FaultCurveClassifier, FaultCause
 from .profile_learner    import ProfileLearner
 from ..                  import __version__
 from .exporter   import PrometheusExporter
+from .otlp_exporter import OTLPExporter
 
 log = structlog.get_logger(__name__)
 
@@ -92,6 +93,7 @@ class AgentConfig:
     pagerduty_key:      Optional[str]  = None   # PagerDuty Events API v2 routing key
     opsgenie_key:       Optional[str]  = None   # Opsgenie API integration key (GenieKey)
     opsgenie_region:    str            = "us"   # "us" | "eu"
+    otlp_endpoint:      Optional[str]  = None   # OTLP/HTTP metrics endpoint (OTel Collector)
     quiet:              bool  = False
 
     # Prometheus
@@ -222,6 +224,8 @@ class ThetaAgent:
                 auth_token        = getattr(config, "health_api_token", None),
             )
         self._exporter     = PrometheusExporter(config.prometheus_port)
+        # Optional OTLP/OpenTelemetry push export (inert unless endpoint set + SDK installed)
+        self._otlp         = OTLPExporter(config.otlp_endpoint)
 
         self._tick_count  = 0
         self._alert_count = 0
@@ -452,7 +456,15 @@ class ThetaAgent:
             telemetry_stale=gpu in self._telemetry_stale,
             telemetry_unavailable=gpu in self._no_rtheta,
         )
-        self._exporter.update_health(gpu, self._health_conditions.health(gpu))
+        _gpu_health = self._health_conditions.health(gpu)
+        self._exporter.update_health(gpu, _gpu_health)
+
+        # Optional OTLP push (no-op unless configured) — mirror the core signals.
+        self._otlp.update_gpu(
+            gpu, rtheta=window.rtheta_mean, temp=raw_sample.temp_junction,
+            power=raw_sample.power_w, drift_sigma=drift.sigma_score,
+            readiness=self._governor.readiness(gpu), schedulable=_gpu_health.schedulable,
+        )
 
         with self._stage("critic", gpu):
             # Feed healthy windows to the Isolation Forest baseline
@@ -1036,6 +1048,8 @@ class ThetaAgent:
         if self.config.enable_prometheus:
             self._exporter.start_server()
 
+        self._otlp.start()   # inert unless an OTLP endpoint is configured
+
         if self._health_api:
             self._health_api.start()
 
@@ -1296,6 +1310,7 @@ class ThetaAgent:
                     log.error("pipeline_error", exc_info=e)
 
         await self._router.close()
+        self._otlp.shutdown()
         if self._dcgm:
             self._dcgm.shutdown()
         if self._redfish:

@@ -234,6 +234,7 @@ def monitor(
     webhook:     Optional[str]   = typer.Option(None, "--webhook",    "-w",  help="Alert webhook URL [default: saved config or none]"),
     pagerduty:   Optional[str]   = typer.Option(None, "--pagerduty",         help="PagerDuty Events API v2 routing key"),
     opsgenie:    Optional[str]   = typer.Option(None, "--opsgenie",          help="Opsgenie API integration key (GenieKey)"),
+    otlp:        Optional[str]   = typer.Option(None, "--otlp",              help="OTLP/HTTP metrics endpoint (OpenTelemetry Collector)"),
     log_file:    Optional[str]   = typer.Option(None, "--log",                help="JSONL alert log file [default: saved config or none]"),
     port:        Optional[int]   = typer.Option(None, "--port",       "-p",  help="Prometheus port; 0 disables [default: saved config or 9101]"),
     quiet:       bool            = typer.Option(False, "--quiet",     "-q",  help="Suppress stdout alerts"),
@@ -254,6 +255,7 @@ def monitor(
     webhook_v    = webhook  if webhook  is not None else saved.get("webhook_url")
     pagerduty_v  = pagerduty if pagerduty is not None else saved.get("pagerduty_key")
     opsgenie_v   = opsgenie  if opsgenie  is not None else saved.get("opsgenie_key")
+    otlp_v       = otlp      if otlp      is not None else saved.get("otlp_endpoint")
     log_file_v   = log_file if log_file is not None else saved.get("alert_log_path")
     port_v       = port     if port     is not None else (
         saved.get("prometheus_port", 9101) if saved.get("enable_prometheus", True) else 0
@@ -268,6 +270,7 @@ def monitor(
         pagerduty_key     = pagerduty_v,
         opsgenie_key      = opsgenie_v,
         opsgenie_region   = saved.get("opsgenie_region", "us"),
+        otlp_endpoint     = otlp_v,
         alert_log_path    = log_file_v,
         prometheus_port   = port_v,
         enable_prometheus = port_v > 0,

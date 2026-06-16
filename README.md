@@ -68,6 +68,8 @@ GPU (pynvml)
 
 **Peer-relative fleet detection** — on a multi-GPU node, Theta also compares each GPU's `R_θ` to its **matched-power node-mates** (median + MAD robust-z, hardware-agnostic relative scale). This is cross-sectional, so unlike the temporal baseline it needs **no warm-up** and catches a unit that has been degraded since before the agent started. On real Princeton H100 telemetry (72 GPUs) this method blind-flagged 3 degraded units — one at robust-z +15.6, two invisible to temperature thresholds. It self-disables on hosts with fewer than 4 matched-power peers, so single-GPU setups never see a peer alert.
 
+**OpenTelemetry (OTLP) export** — Prometheus pull is the default, but fleets standardized on OpenTelemetry can have Theta push its core signals (R_θ, temperature, power, drift σ, readiness, schedulable) over OTLP/HTTP to their OTel Collector — no scrape config. Optional: `pip install runtheta[otlp]`, then `theta monitor --otlp <endpoint>`. Inert if the SDK isn't installed, so the base agent stays dependency-light.
+
 **MIG / vGPU aware** — temperature and power are properties of the physical die, so Theta detects partitioning and virtualization and handles R_θ correctly instead of emitting nonsense. Under **MIG**, R_θ is reported per physical GPU (shared across all instances on that die), not fabricated per-instance. Under **vGPU**, if the guest can't read temperature/power, Theta marks the GPU `TelemetryUnavailable` and says "can't assess" rather than guessing — and keeps it schedulable (you don't drain a fleet because the monitor can't see it). Detection is best-effort and degrades gracefully on drivers/SKUs that don't expose the MIG/virtualization APIs.
 
 **Health-as-conditions (scheduler-facing)** — alerts are edge events; a scheduler deciding whether to cordon or drain a node needs the orthogonal thing — the current *level* state: "is GPU 3 fit to run work right now, what's wrong, and since when?" Theta exposes per-GPU **health conditions** (the node-problem-detector pattern): a status (`healthy` / `warming` / `degraded` / `critical`), a single `schedulable` flag, and named conditions (`CoolingCritical`, `CoolingDegraded`, `ZombieContext`, `Throttling`, `EccErrors`, `TelemetryStale`) with transition timestamps — derived from signals the agent already computes. Read it with `theta health`, the `/api/v1/conditions` endpoint, or the `theta_gpu_schedulable` / `theta_gpu_health_condition` metrics. A GPU still *warming up* stays schedulable (the GPU is fine; only the monitor is learning).
@@ -99,6 +101,7 @@ theta monitor --gpus 0,1,3          Monitor specific GPUs
 theta monitor --webhook <url>       Send alerts to Slack / generic webhook
 theta monitor --pagerduty <key>     Route alerts to PagerDuty (Events API v2)
 theta monitor --opsgenie <key>      Route alerts to Opsgenie (Alert API)
+theta monitor --otlp <endpoint>     Push metrics over OTLP/HTTP (needs runtheta[otlp])
 theta monitor --log alerts.jsonl    Append alerts to JSONL file
 theta monitor --port 9101           Prometheus metrics port (0 = disabled)
 theta monitor --nb                  Use Naive Bayes instead of Decision Tree
