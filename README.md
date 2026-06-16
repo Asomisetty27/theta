@@ -68,6 +68,8 @@ GPU (pynvml)
 
 **Peer-relative fleet detection** — on a multi-GPU node, Theta also compares each GPU's `R_θ` to its **matched-power node-mates** (median + MAD robust-z, hardware-agnostic relative scale). This is cross-sectional, so unlike the temporal baseline it needs **no warm-up** and catches a unit that has been degraded since before the agent started. On real Princeton H100 telemetry (72 GPUs) this method blind-flagged 3 degraded units — one at robust-z +15.6, two invisible to temperature thresholds. It self-disables on hosts with fewer than 4 matched-power peers, so single-GPU setups never see a peer alert.
 
+**Health-as-conditions (scheduler-facing)** — alerts are edge events; a scheduler deciding whether to cordon or drain a node needs the orthogonal thing — the current *level* state: "is GPU 3 fit to run work right now, what's wrong, and since when?" Theta exposes per-GPU **health conditions** (the node-problem-detector pattern): a status (`healthy` / `warming` / `degraded` / `critical`), a single `schedulable` flag, and named conditions (`CoolingCritical`, `CoolingDegraded`, `ZombieContext`, `Throttling`, `EccErrors`, `TelemetryStale`) with transition timestamps — derived from signals the agent already computes. Read it with `theta health`, the `/api/v1/conditions` endpoint, or the `theta_gpu_schedulable` / `theta_gpu_health_condition` metrics. A GPU still *warming up* stays schedulable (the GPU is fine; only the monitor is learning).
+
 **First-run trust + false-positive budget** — the agent earns trust on a stranger's fleet by being humble. Inferential alerts (anything derived from R_θ statistics — drift, peer, fault-curve, the unsupervised critic) are **held while a GPU is still warming up** ("learning your baseline, not yet confident"); ground-truth hardware faults (ECC, Xid, throttle) fire immediately. A **false-positive circuit breaker** watches the per-GPU alert rate — if it exceeds the budget, that means the thresholds are likely mis-calibrated for this hardware, so the agent goes quiet on that GPU and fires **one** meta-alert recommending `theta calibrate` instead of spraying wrong alarms. While a GPU has an active critical, concurrent lower-severity alerts for it are inhibited (Alertmanager-style). Readiness and suppression are exported (`theta_gpu_readiness`, `theta_alerts_suppressed_total`).
 
 **Per-job report card (`theta report`, SLURM/jobstats)** — jobstats already scrapes per-GPU temperature, power, and utilization into Prometheus, labelled by SLURM `jobid`, node, and HGX ordinal — it just never divides temp by power. `theta report <jobid>` pulls a job's telemetry from that same Prometheus and produces a per-job cooling-health card: per-GPU R_θ, the fleet mean, and any degraded units in two tiers (**flagged** = act, **watch** = elevated). No new agent, no new telemetry. On the real Princeton incident job it reproduces the E009 result — fleet mean R_θ 0.0603 C/W, j13g2:7 flagged at +14.2σ (81 °C) and j12g2:6 at +4.0σ (72 °C, invisible to a temperature threshold), with the marginal j13g2:2 on watch. Works live (`--prom <url> --start --end`) or against saved Prometheus exports (`--export <dir>`).
@@ -101,6 +103,7 @@ theta baseline --gpu 0 --manual 24  Set T_ref manually (°C)
 theta classify                      Snapshot classify all GPUs right now
 theta fleet-scan export.json        Cross-node position-conditioned anomaly scan
 theta report <jobid> --prom <url>   Per-job R_θ report card (SLURM/jobstats)
+theta health                        Scheduler-facing health conditions (is each GPU fit to run?)
 theta serve --port 9101             Metrics export only (no stdout alerts)
 theta train /path/data.csv          Retrain bundled models from new data
 ```
@@ -123,6 +126,8 @@ theta train /path/data.csv          Retrain bundled models from new data
 | `theta_gpu_alerts_total` | counter | Alerts (labels: `severity`, `state`) |
 | `theta_gpu_readiness` | gauge | 1 = confident, 0 = warming or FP-breaker tripped |
 | `theta_alerts_suppressed_total` | counter | Inferential alerts withheld by the governor (label: `reason`) |
+| `theta_gpu_schedulable` | gauge | 1 if the GPU is fit to schedule new work, else 0 |
+| `theta_gpu_health_condition` | gauge | 1 if a named health condition is active (label: `condition`) |
 
 All metrics include a `gpu_index` label.
 

@@ -78,12 +78,14 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
         get_status: Callable,
         get_poll_latency: Callable,
         get_agent_details: Optional[Callable],
+        get_conditions: Optional[Callable] = None,
         *args,
         **kwargs,
     ):
         self._get_status        = get_status
         self._get_poll_latency  = get_poll_latency
         self._get_agent_details = get_agent_details
+        self._get_conditions    = get_conditions
         super().__init__(*args, **kwargs)
 
     def _json(self, data: dict, code: int = 200) -> None:
@@ -148,6 +150,30 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
                 self._json({"error": f"gpu {idx} not found"}, 404)
             else:
                 self._json(gpu_data)
+
+        elif path == "/api/v1/conditions":
+            # Scheduler-facing health conditions (NPD pattern): per-GPU level
+            # state + `schedulable` + a fleet roll-up. Distinct from /health
+            # (which is point-in-time scores) and from alerts (edge events).
+            if self._get_conditions is None:
+                self._json({"error": "conditions endpoint not wired"}, 501)
+            else:
+                self._json(self._get_conditions())
+
+        elif path.startswith("/api/v1/conditions/gpu/"):
+            if self._get_conditions is None:
+                self._json({"error": "conditions endpoint not wired"}, 501)
+                return
+            try:
+                idx = int(path.split("/")[-1])
+            except ValueError:
+                self._json({"error": "invalid gpu index"}, 400)
+                return
+            gpu = self._get_conditions().get("gpus", {}).get(str(idx))
+            if gpu is None:
+                self._json({"error": f"gpu {idx} not found"}, 404)
+            else:
+                self._json(gpu)
 
         elif path == "/api/v1/agent/fleet/status":
             self._json(self._build_fleet_status())
@@ -257,6 +283,7 @@ class HealthAPIServer:
         get_status:        Callable,
         get_poll_latency:  Callable,
         get_agent_details: Optional[Callable] = None,
+        get_conditions:    Optional[Callable] = None,
         auth_token:        Optional[str] = None,
         bind_host:         str = "0.0.0.0",
     ):
@@ -264,6 +291,7 @@ class HealthAPIServer:
         self._get_status        = get_status
         self._get_poll_latency  = get_poll_latency
         self._get_agent_details = get_agent_details
+        self._get_conditions    = get_conditions
         self._bind_host         = bind_host
         self._auth_token        = _resolve_token(auth_token)
         self._server:  Optional[HTTPServer] = None
@@ -273,6 +301,7 @@ class HealthAPIServer:
         get_status        = self._get_status
         get_poll_latency  = self._get_poll_latency
         get_agent_details = self._get_agent_details
+        get_conditions    = self._get_conditions
         token             = self._auth_token
 
         if token is None:
@@ -289,7 +318,8 @@ class HealthAPIServer:
 
         def handler_factory(*args, **kwargs):
             return HealthRequestHandler(
-                get_status, get_poll_latency, get_agent_details, *args, **kwargs,
+                get_status, get_poll_latency, get_agent_details,
+                get_conditions, *args, **kwargs,
             )
 
         try:

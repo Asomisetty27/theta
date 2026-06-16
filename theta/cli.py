@@ -173,6 +173,58 @@ def status(
         console.print("[dim]Is the NVIDIA driver installed? Try: nvidia-smi[/dim]")
 
 
+# ── health (scheduler-facing conditions) ──────────────────────────────────────
+
+@app.command()
+def health(
+    port: int = typer.Option(9102, "--port", "-p", help="Health API port (default: 9102)"),
+    schedulable_only: bool = typer.Option(False, "--schedulable", help="List only schedulable GPUs"),
+):
+    """
+    Scheduler-facing health conditions — is each GPU fit to run work, and why?
+
+    Shows the current LEVEL state (not alert events): per-GPU status, the
+    `schedulable` flag a cordon/drain decision reads, and any active health
+    conditions with how long they've held. Queries the running daemon's
+    conditions endpoint.
+    """
+    import urllib.request
+
+    try:
+        with urllib.request.urlopen(
+            f"http://localhost:{port}/api/v1/conditions", timeout=1.0
+        ) as resp:
+            data = json.loads(resp.read())
+    except Exception:
+        console.print(f"[yellow]No daemon on port {port}.[/] Start one: "
+                      f"[bold]theta monitor[/bold]  (health API needs --health-port).")
+        raise typer.Exit(1)
+
+    gpus = data.get("gpus", {})
+    summary = data.get("summary", {})
+    _color = {"healthy": "green", "warming": "blue", "degraded": "yellow",
+              "critical": "red", "unknown": "dim"}
+
+    t = Table(box=box.SIMPLE_HEAVY, show_header=True)
+    t.add_column("GPU", style="bold", no_wrap=True)
+    t.add_column("Status", no_wrap=True)
+    t.add_column("Schedulable", justify="center", no_wrap=True)
+    t.add_column("Active conditions")
+    for idx_str, gpu in sorted(gpus.items(), key=lambda x: int(x[0])):
+        if schedulable_only and not gpu.get("schedulable"):
+            continue
+        st = gpu.get("status", "unknown")
+        col = _color.get(st, "white")
+        conds = ", ".join(c["name"] for c in gpu.get("conditions", [])) or "[dim]none[/dim]"
+        sched = "[green]yes[/]" if gpu.get("schedulable") else "[red]no[/]"
+        t.add_row(f"GPU {idx_str}", f"[{col}]{st}[/]", sched, conds)
+
+    console.print(t)
+    bs = summary.get("by_status", {})
+    console.print(f"[dim]{summary.get('schedulable', 0)}/{summary.get('total', 0)} "
+                  f"schedulable · " + " · ".join(f"{k}:{v}" for k, v in bs.items()) + "[/dim]")
+
+
 # ── monitor ───────────────────────────────────────────────────────────────────
 
 @app.command()

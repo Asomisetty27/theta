@@ -36,6 +36,7 @@ from .calibrate  import CalibrationManager
 from .detector   import DriftDetector
 from .peer       import PeerRelativeDetector
 from .governor    import AlertGovernor, Action
+from .health      import HealthConditionTracker
 from .state      import GPUStateMachine
 from .correlator import FleetCorrelator
 from .silicon         import EccMonitor, MicroThrottleDetector, XIDParser
@@ -153,6 +154,10 @@ class ThetaAgent:
         # which gates inferential alerts through this governor (warming / inhibition
         # / budget breaker). Ground-truth hardware faults bypass it. See governor.py.
         self._governor     = AlertGovernor()
+        # Health-as-conditions: scheduler-facing level state (NPD pattern).
+        self._health_conditions = HealthConditionTracker()
+        self._peer_flag:      dict[int, tuple[bool, bool]] = {}   # gpu → (flagged, critical)
+        self._telemetry_stale: set[int] = set()                  # gpus with stale telemetry
         self._statemachine   = GPUStateMachine()
         self._correlator     = FleetCorrelator()
         self._ecc_monitor    = EccMonitor()
@@ -207,6 +212,7 @@ class ThetaAgent:
                 get_status        = self._health_status,
                 get_poll_latency  = lambda: self._poll_latency_ema,
                 get_agent_details = self._get_agent_details,
+                get_conditions    = lambda: self._health_conditions.fleet_summary(),
                 auth_token        = getattr(config, "health_api_token", None),
             )
         self._exporter     = PrometheusExporter(config.prometheus_port)
@@ -296,7 +302,9 @@ class ThetaAgent:
                 self._poll_latency_baseline[gpu] = new_ema
 
             baseline_lat = self._poll_latency_baseline.get(gpu)
-            if baseline_lat and new_ema > baseline_lat * 2.5 and n > 20:
+            _stale = bool(baseline_lat and new_ema > baseline_lat * 2.5 and n > 20)
+            (self._telemetry_stale.add if _stale else self._telemetry_stale.discard)(gpu)
+            if _stale:
                 last_lat_alert = self._poll_latency_alert_ts.get(gpu, 0.0)
                 if ts - last_lat_alert > 300:
                     self._poll_latency_alert_ts[gpu] = ts
@@ -322,11 +330,12 @@ class ThetaAgent:
                 self._dcgm.enrich(gpu, raw_sample)
 
         # 0b. Silicon-level checks: ECC, micro-throttle, XID semantic parsing
+        _throttle_now = False
         with self._stage("silicon", gpu):
-            for silicon_alert in (
-                self._ecc_monitor.update(raw_sample),
-                self._micro_throttle.update(raw_sample),
-            ):
+            _ecc_alert      = self._ecc_monitor.update(raw_sample)
+            _throttle_alert = self._micro_throttle.update(raw_sample)
+            _throttle_now   = _throttle_alert is not None
+            for silicon_alert in (_ecc_alert, _throttle_alert):
                 if silicon_alert is not None:
                     await self._emit(silicon_alert)   # ground-truth — ECC/throttle facts
 
@@ -418,7 +427,20 @@ class ThetaAgent:
         # Feed the governor this GPU's readiness: "confident" once the drift
         # detector has an established baseline. Gates first-run alert holding.
         self._governor.note_cycle(gpu, ready=self._detector.get_baseline(gpu) is not None, ts=ts)
+        _warming = self._governor.is_warming(gpu, ts)
         self._exporter.update_readiness(gpu, self._governor.readiness(gpu))
+
+        # Health-as-conditions: update the scheduler-facing level state from the
+        # signals just computed (latest peer flags carried from _run_peer_detection).
+        _peer_flag, _peer_crit = self._peer_flag.get(gpu, (False, False))
+        self._health_conditions.observe(
+            gpu, ts=ts, warming=_warming, state=state,
+            drift_warning=drift.is_drifting, drift_critical=drift.is_critical,
+            peer_flagged=_peer_flag, peer_critical=_peer_crit,
+            throttling=_throttle_now, ecc_dbit=getattr(raw_sample, "ecc_dbit", 0) or 0,
+            telemetry_stale=gpu in self._telemetry_stale,
+        )
+        self._exporter.update_health(gpu, self._health_conditions.health(gpu))
 
         with self._stage("critic", gpu):
             # Feed healthy windows to the Isolation Forest baseline
@@ -941,6 +963,9 @@ class ThetaAgent:
             return
 
         for gpu, r in self._peer.evaluate(snapshot, ts).items():
+            # Carry current peer state into the health tracker for EVERY GPU
+            # (not just the rate-limited alerts), so conditions stay accurate.
+            self._peer_flag[gpu] = (r.is_anomaly, r.is_critical)
             if not r.is_anomaly:
                 continue
             if ts - self._peer_alerted.get(gpu, 0.0) < self.PEER_ALERT_COOLDOWN_S:

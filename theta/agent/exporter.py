@@ -135,6 +135,14 @@ class PrometheusExporter:
                                     "Inferential alerts withheld by the governor",
                                     ["gpu_index", "reason"])
 
+        # Health-as-conditions (scheduler-facing level state, NPD pattern)
+        self.g_schedulable = Gauge("theta_gpu_schedulable",
+                                   "1 if the GPU is fit to schedule new work, else 0",
+                                   ["gpu_index"])
+        self.g_condition   = Gauge("theta_gpu_health_condition",
+                                   "1 if a named health condition is currently active",
+                                   ["gpu_index", "condition"])
+
         # Build info
         try:
             self.i_build = Info("theta_build", "Theta agent build info")
@@ -230,6 +238,17 @@ class PrometheusExporter:
         if not PROMETHEUS_AVAILABLE:
             return
         self.c_suppressed.labels(str(gpu_index), reason).inc()
+
+    def update_health(self, gpu_index: int, gpu_health) -> None:
+        """Reflect a GpuHealth into the schedulable + per-condition gauges."""
+        if not PROMETHEUS_AVAILABLE:
+            return
+        from .health import ALL_CONDITIONS
+        idx = str(gpu_index)
+        self.g_schedulable.labels(idx).set(1.0 if gpu_health.schedulable else 0.0)
+        active = {c.name for c in gpu_health.conditions}
+        for name in ALL_CONDITIONS:
+            self.g_condition.labels(idx, name).set(1.0 if name in active else 0.0)
 
     def update_fault_diagnosis(self, diagnosis: FaultDiagnosis) -> None:
         if not PROMETHEUS_AVAILABLE:
