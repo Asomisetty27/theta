@@ -119,3 +119,24 @@ def test_watch_tier_catches_marginal(tmp_path):
         [tmp_path / "t.json", tmp_path / "p.json", tmp_path / "u.json"])))
     # mild degradation surfaces somewhere (watch or flagged), not silently dropped
     assert "n2:1" in rep.watch or "n2:1" in rep.flagged
+
+
+def test_jobid_filter_isolates_job(tmp_path):
+    """An export holding two jobs must isolate the requested jobid (real-world: a
+    Prometheus dir / dump routinely contains many jobs). Unknown jobid -> fall
+    back to all series so label-less exports still work."""
+    def s(name, inst, ordn, jid, base):
+        return {"metric": {"__name__": name, "instance": inst, "ordinal": str(ordn), "jobid": jid},
+                "values": [[t, str(base)] for t in range(60)]}
+    result = []
+    for o in (0, 1):
+        for nm, base in (("nvidia_gpu_temperature_celsius", 60),
+                         ("nvidia_gpu_power_usage_milliwatts", 650000),
+                         ("nvidia_gpu_duty_cycle", 95)):
+            result.append(s(nm, "della-n1:1", o, "AAA", base))
+            result.append(s(nm, "della-n9:1", o, "BBB", base))
+    p = tmp_path / "mixed.json"
+    p.write_text(json.dumps({"status": "success", "data": {"resultType": "matrix", "result": result}}))
+    assert {k[0] for k in load_exports([p], jobid="AAA")} == {"n1"}      # isolates job AAA
+    assert {k[0] for k in load_exports([p])} == {"n1", "n9"}            # no filter -> both
+    assert {k[0] for k in load_exports([p], jobid="ZZZ")} == {"n1", "n9"}  # unknown -> fallback all

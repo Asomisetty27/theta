@@ -80,10 +80,17 @@ def _metric_kind(name: str) -> Optional[str]:
     return None
 
 
-def _ingest_result_block(result: list, series: dict) -> None:
-    """Fold one Prometheus `result` array into series[(node,ordinal)][kind]."""
+def _ingest_result_block(result: list, series: dict, jobid: Optional[str] = None) -> None:
+    """Fold one Prometheus `result` array into series[(node,ordinal)][kind].
+
+    If `jobid` is given, only ingest series whose `jobid` label matches — so a
+    Prometheus export dir holding several jobs (the common case) is isolated to
+    the requested job instead of merging jobs into one (wrong) comparison.
+    """
     for s in result:
         m = s.get("metric", {})
+        if jobid is not None and "jobid" in m and str(m.get("jobid")) != str(jobid):
+            continue
         kind = _metric_kind(m.get("__name__", ""))
         if kind is None:
             continue
@@ -102,14 +109,25 @@ def _ingest_result_block(result: list, series: dict) -> None:
                 continue
 
 
-def load_exports(paths: list[Path]) -> dict:
-    """Load saved Prometheus query_range JSON files into aligned per-GPU series."""
-    series: dict = {}
-    for p in paths:
-        doc = json.loads(Path(p).read_text())
-        result = doc.get("data", {}).get("result", doc if isinstance(doc, list) else [])
-        _ingest_result_block(result, series)
-    return _align(series)
+def load_exports(paths: list[Path], jobid: Optional[str] = None) -> dict:
+    """Load saved Prometheus query_range JSON into aligned per-GPU series.
+
+    When `jobid` is set, filter to that job (export dirs often hold many jobs). If
+    the filter matches nothing (e.g. an old export with no jobid label), fall back
+    to ingesting everything so the tool still works on label-less fixtures.
+    """
+    def _load(jid: Optional[str]) -> dict:
+        series: dict = {}
+        for p in paths:
+            doc = json.loads(Path(p).read_text())
+            result = doc.get("data", {}).get("result", doc if isinstance(doc, list) else [])
+            _ingest_result_block(result, series, jobid=jid)
+        return _align(series)
+
+    aligned = _load(jobid)
+    if jobid is not None and not aligned:
+        aligned = _load(None)   # no jobid label in export → use all series
+    return aligned
 
 
 def load_prometheus(prom_url: str, jobid: str, start: float, end: float,

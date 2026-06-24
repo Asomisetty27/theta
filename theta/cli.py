@@ -579,7 +579,7 @@ def report(
         if not files:
             console.print(f"[red]no JSON exports found under[/] {export}")
             raise typer.Exit(2)
-        aligned = load_exports(files)
+        aligned = load_exports(files, jobid=jobid)
     elif prom:
         if start is None or end is None:
             console.print("[red]--start and --end (unix seconds) are required in live mode[/]")
