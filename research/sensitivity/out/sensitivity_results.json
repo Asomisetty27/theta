@@ -1,0 +1,37 @@
+{
+  "n_total": 4570,
+  "tiers": [
+    {
+      "tier": "idle",
+      "n": 2497,
+      "mean_power_w": 11.4,
+      "mean_rtheta_at35": 1.67,
+      "dR_dTamb_emp_CW_per_C": -0.0898,
+      "dR_dTamb_analytic_-1/P": -0.0898,
+      "rel_sensitivity_pct_per_C": 7.1,
+      "swing_pct_per_5C_ambient_error": 35.7
+    },
+    {
+      "tier": "mid",
+      "n": 958,
+      "mean_power_w": 31.7,
+      "mean_rtheta_at35": 1.207,
+      "dR_dTamb_emp_CW_per_C": -0.0316,
+      "dR_dTamb_analytic_-1/P": -0.0316,
+      "rel_sensitivity_pct_per_C": 2.7,
+      "swing_pct_per_5C_ambient_error": 13.4
+    },
+    {
+      "tier": "peak",
+      "n": 1115,
+      "mean_power_w": 67.9,
+      "mean_rtheta_at35": 0.516,
+      "dR_dTamb_emp_CW_per_C": -0.0147,
+      "dR_dTamb_analytic_-1/P": -0.0147,
+      "rel_sensitivity_pct_per_C": 3.2,
+      "swing_pct_per_5C_ambient_error": 15.9
+    }
+  ],
+  "empirical_vs_analytic_mean_abs_err": 3e-06,
+  "note": "dR_theta/dT_amb = -1/P confirmed; sensitivity largest at idle (low P), smallest at peak. swing_pct_per_5C is the F2 figure per tier."
+}
