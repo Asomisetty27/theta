@@ -1,0 +1,120 @@
+{
+  "n_all": 4390,
+  "n_steady": 2288,
+  "class_counts": {
+    "3": 1999,
+    "1": 1161,
+    "0": 630,
+    "2": 600
+  },
+  "raw": {
+    "naive_bayes": {
+      "accuracy": 0.8073,
+      "f1_macro": 0.7767
+    },
+    "random_forest": {
+      "accuracy": 0.9786,
+      "f1_macro": 0.9725
+    },
+    "decision_tree": {
+      "accuracy": 0.9772,
+      "f1_macro": 0.9712
+    }
+  },
+  "steady_state": {
+    "naive_bayes": {
+      "accuracy": 0.8986,
+      "f1_macro": 0.8077
+    },
+    "random_forest": {
+      "accuracy": 0.9952,
+      "f1_macro": 0.9931
+    },
+    "decision_tree": {
+      "accuracy": 0.9956,
+      "f1_macro": 0.9938
+    }
+  },
+  "nb_model_equation": {
+    "priors": {
+      "clean_idle": 0.1451,
+      "under_load": 0.4401,
+      "zombie_recovery": 0.2574,
+      "child_exit_recovery": 0.1573
+    },
+    "per_class_gaussians": {
+      "clean_idle": {
+        "rtheta_cwatt": {
+          "mean": 1.4826,
+          "var": 0.11977
+        },
+        "power_w": {
+          "mean": 19.6776,
+          "var": 86.81851
+        },
+        "util_pct": {
+          "mean": 0.0,
+          "var": 0.0
+        },
+        "perf_state_num": {
+          "mean": 5.3253,
+          "var": 14.24358
+        }
+      },
+      "under_load": {
+        "rtheta_cwatt": {
+          "mean": 0.6859,
+          "var": 0.01403
+        },
+        "power_w": {
+          "mean": 67.8223,
+          "var": 1.02647
+        },
+        "util_pct": {
+          "mean": 99.9553,
+          "var": 0.04269
+        },
+        "perf_state_num": {
+          "mean": 0.0,
+          "var": 0.0
+        }
+      },
+      "zombie_recovery": {
+        "rtheta_cwatt": {
+          "mean": 1.5425,
+          "var": 0.00195
+        },
+        "power_w": {
+          "mean": 31.5983,
+          "var": 0.26173
+        },
+        "util_pct": {
+          "mean": 0.0,
+          "var": 0.0
+        },
+        "perf_state_num": {
+          "mean": 0.0,
+          "var": 0.0
+        }
+      },
+      "child_exit_recovery": {
+        "rtheta_cwatt": {
+          "mean": 2.0112,
+          "var": 0.18582
+        },
+        "power_w": {
+          "mean": 12.3147,
+          "var": 0.65824
+        },
+        "util_pct": {
+          "mean": 0.0,
+          "var": 0.0
+        },
+        "perf_state_num": {
+          "mean": 8.0,
+          "var": 0.0
+        }
+      }
+    }
+  }
+}
