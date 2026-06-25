@@ -286,7 +286,7 @@ Stage 2 (in progress): Cal Poly DGX B200 AI Factory · E005–E008
 
 Theta is pre-1.0 and honest about what is and isn't proven:
 
-- **Validated:** peer-relative degradation detection blind-flagged 3 degraded units on 72 real Princeton H100s (one at robust-z +15.6, two invisible to temperature thresholds); the position-conditioned cross-node scan recovers all 3 at zero false positives. The Decision-Tree classifier scores 100% 5-fold CV on Tesla T4 steady-state data.
+- **Validated:** peer-relative degradation detection blind-flagged 3 degraded units on 72 real Princeton H100s (one at robust-z +15.6, two invisible to temperature thresholds); the position-conditioned cross-node scan recovers all 3 at zero false positives. The Decision-Tree classifier scores 100% 5-fold CV on Tesla T4 steady-state data. Reproduce the blind-flag result on the real export: `python tools/validate_e009_princeton.py <export.json>`.
 - **Trained on Tesla T4.** The bundled classifier's R_θ operating range is T4-specific, so `theta monitor` refuses to start on non-T4 hardware until you run `theta calibrate`. B200/H100/A100 validation (Stage 2, Cal Poly DGX B200 AI Factory) is in progress.
 - **Lead-time-before-throttle is not yet hardware-validated.** The predictive-maintenance claim is exercised in simulation (`sim/`) pending the physical E-LT testbed in fall 2026.
 - **AMD ROCm (MI200/MI300)** is implemented and unit-tested against the amdsmi API, but not yet validated on real MI300 silicon.
