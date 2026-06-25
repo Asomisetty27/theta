@@ -5,8 +5,8 @@ Lightweight JSONL-based CRM for tracking cold outreach to early adopters.
 Stored at ~/.theta/outreach.jsonl — one record per contact, updated in place.
 
 Usage:
-  python tools/discovery_tracker.py add --org "Princeton RC" --name "Jonathan Halverson" \
-      --email "jdh4@princeton.edu" --notes "HPC training lead, 300 H100 cluster"
+  python tools/discovery_tracker.py add --org "Example RC" --name "Jane Doe" \
+      --email "jane@example.edu" --notes "HPC training lead, 300 H100 cluster"
 
   python tools/discovery_tracker.py list
   python tools/discovery_tracker.py list --status sent

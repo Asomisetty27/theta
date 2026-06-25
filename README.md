@@ -1,5 +1,10 @@
 # Theta
 
+[![PyPI version](https://img.shields.io/pypi/v/runtheta)](https://pypi.org/project/runtheta/)
+[![Python](https://img.shields.io/pypi/pyversions/runtheta)](https://pypi.org/project/runtheta/)
+[![CI](https://github.com/Asomisetty27/theta/actions/workflows/ci.yml/badge.svg)](https://github.com/Asomisetty27/theta/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 **GPU thermal-power forensics agent.** Computes `R_θ = ΔT / P` in real time from your existing DCGM telemetry. That ratio is the only signal that separates a busy-hot GPU from a failing-hot one — and no incumbent computes it.
 
 ```
@@ -274,6 +279,17 @@ CSV schema: `phase, trial_second, rtheta_cwatt, power_w, util_pct, perf_state, .
 
 Stage 1: 4,570 rows · Tesla T4 · E001–E004 · 9 child-exit trials  
 Stage 2 (in progress): Cal Poly DGX B200 AI Factory · E005–E008
+
+---
+
+## Status & limitations
+
+Theta is pre-1.0 and honest about what is and isn't proven:
+
+- **Validated:** peer-relative degradation detection blind-flagged 3 degraded units on 72 real Princeton H100s (one at robust-z +15.6, two invisible to temperature thresholds); the position-conditioned cross-node scan recovers all 3 at zero false positives. The Decision-Tree classifier scores 100% 5-fold CV on Tesla T4 steady-state data.
+- **Trained on Tesla T4.** The bundled classifier's R_θ operating range is T4-specific, so `theta monitor` refuses to start on non-T4 hardware until you run `theta calibrate`. B200/H100/A100 validation (Stage 2, Cal Poly DGX B200 AI Factory) is in progress.
+- **Lead-time-before-throttle is not yet hardware-validated.** The predictive-maintenance claim is exercised in simulation (`sim/`) pending the physical E-LT testbed in fall 2026.
+- **AMD ROCm (MI200/MI300)** is implemented and unit-tested against the amdsmi API, but not yet validated on real MI300 silicon.
 
 ---
 
