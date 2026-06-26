@@ -92,8 +92,8 @@ def collect(
     if coolant_c is not None:
         print(f"  Coolant:   {coolant_c}°C (supplied)")
     else:
-        print(f"  Coolant:   not supplied — add BMC reading to CSV manually if available")
-    print(f"\n  [Ctrl+C to stop early]\n")
+        print("  Coolant:   not supplied — add BMC reading to CSV manually if available")
+    print("\n  [Ctrl+C to stop early]\n")
 
     signal.signal(signal.SIGINT, _sigint)
 
@@ -149,8 +149,8 @@ def collect(
 
     nv.nvmlShutdown()
     print(f"\n  Done. {rows_written} rows → {out_path}")
-    print(f"\n  Send this file to the ThermalOS team for Stage 2 calibration.")
-    print(f"  It will NOT be shared further without your consent.")
+    print("\n  Send this file to the ThermalOS team for Stage 2 calibration.")
+    print("  It will NOT be shared further without your consent.")
 
 
 if __name__ == "__main__":

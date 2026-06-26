@@ -37,6 +37,13 @@ class FaultCause(Enum):
     AIRFLOW_BLOCKAGE  = "airflow_blockage"
     MOUNTING_EVENT    = "mounting_event"
     HBM_THERMAL       = "hbm_thermal"
+    # Non-thermal subsystems. The curve tracker (thermal) never emits these;
+    # they are surfaced by the causal engine from fabric/power telemetry the
+    # collector already exposes (nvlink_errors, pcie throughput, clock
+    # efficiency, power-violation time). They matter because a GPU farm can
+    # lose throughput with every temperature graph looking perfectly healthy.
+    FABRIC_LINK       = "fabric_link"       # NVLink/PCIe errors degrading comms
+    POWER_DELIVERY    = "power_delivery"    # power-cap / delivery limiting clocks, thermals normal
     INSUFFICIENT_DATA = "insufficient_data"
 
 
@@ -48,6 +55,8 @@ FAULT_REMEDIATION = {
     FaultCause.AIRFLOW_BLOCKAGE:  "Airflow path obstructed. Check cable routing, rack clearance, HVAC.",
     FaultCause.MOUNTING_EVENT:    "Heatsink contact pressure may have changed. Verify mounting hardware after last maintenance.",
     FaultCause.HBM_THERMAL:       "HBM/VRAM thermal issue. Reduce memory-intensive workload frequency or check VRAM cooling.",
+    FaultCause.FABRIC_LINK:       "NVLink/PCIe errors rising. Check cabling/seating, NVSwitch health, and link retraining counters.",
+    FaultCause.POWER_DELIVERY:    "Clocks limited by power, thermals normal. Check power cap, PSU headroom, and board power delivery.",
     FaultCause.INSUFFICIENT_DATA: "Still collecting samples across both power tiers — no diagnosis yet.",
 }
 

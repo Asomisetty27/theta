@@ -24,7 +24,7 @@ try:
     from opentelemetry.sdk.metrics import MeterProvider
     from opentelemetry.sdk.metrics.export import PeriodicExportingMetricReader
     from opentelemetry.sdk.resources import Resource
-    from opentelemetry.metrics import Observation, CallbackOptions
+    from opentelemetry.metrics import Observation
     from opentelemetry.exporter.otlp.proto.http.metric_exporter import OTLPMetricExporter
     OTLP_AVAILABLE = True
 except Exception:  # SDK not installed → inert
@@ -71,12 +71,18 @@ class OTLPExporter:
         if not self._enabled:
             return
         s = self._snap
-        if rtheta      is not None: s.rtheta[gpu]      = float(rtheta)
-        if temp        is not None: s.temp[gpu]        = float(temp)
-        if power       is not None: s.power[gpu]       = float(power)
-        if drift_sigma is not None: s.drift_sigma[gpu] = float(drift_sigma)
-        if readiness   is not None: s.readiness[gpu]   = float(readiness)
-        if schedulable is not None: s.schedulable[gpu] = 1.0 if schedulable else 0.0
+        if rtheta is not None:
+            s.rtheta[gpu] = float(rtheta)
+        if temp is not None:
+            s.temp[gpu] = float(temp)
+        if power is not None:
+            s.power[gpu] = float(power)
+        if drift_sigma is not None:
+            s.drift_sigma[gpu] = float(drift_sigma)
+        if readiness is not None:
+            s.readiness[gpu] = float(readiness)
+        if schedulable is not None:
+            s.schedulable[gpu] = 1.0 if schedulable else 0.0
 
     # ---- lifecycle ------------------------------------------------------------
     def start(self) -> None:

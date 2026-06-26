@@ -70,6 +70,17 @@ class RawSample:
     pcie_rx_kbps:     int   = 0    # PCIe receive throughput (KiB/s)
     gr_engine_active: float = 0.0  # graphics/compute engine active fraction 0–1 (DCGM prof)
     dram_active:      float = 0.0  # memory interface active fraction 0–1 (DCGM prof)
+    # DCGM throttle-cause accounting (fields 241 / 240 / 112). The NVML
+    # throttle_reasons bitmask above says WHY a clock is reduced *right now*;
+    # these add the duration dimension — monotonically-accumulating per-cause
+    # throttle-time counters — so downstream can take a per-interval delta and
+    # know HOW LONG the GPU spent thermal- vs power-limited. This is the signal
+    # DCGM exposes that the instantaneous bitmask cannot. Counters are in DCGM's
+    # violation-time unit (microseconds); only deltas are used, so the exact
+    # scale never matters to the detector.
+    thermal_violation_us:     int = 0   # DCGM 241 — accumulated thermal-throttle time
+    power_violation_us:       int = 0   # DCGM 240 — accumulated power-throttle time
+    dcgm_clock_event_reasons: int = 0   # DCGM 112 — clock-event bitmask (DCGM-sourced)
 
 
 @dataclass(slots=True)

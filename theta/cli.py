@@ -148,7 +148,6 @@ def status(
             h    = nv.nvmlDeviceGetHandleByIndex(i)
             name = nv.nvmlDeviceGetName(h)
             name = name.decode() if isinstance(name, bytes) else name
-            temp = nv.nvmlDeviceGetTemperature(h, nv.NVML_TEMPERATURE_GPU)
             pw   = nv.nvmlDeviceGetPowerUsage(h) / 1000.0
             util = nv.nvmlDeviceGetUtilizationRates(h).gpu
             ps   = nv.nvmlDeviceGetPerformanceState(h)
@@ -733,9 +732,9 @@ def calibrate(
             f"  Using supplied ambient [bold]{ambient:.1f} °C[/bold] as T_ref, "
             f"profile R_θ_idle estimate [bold]{rtheta_idle:.4f} C/W[/bold]"
             + (" [dim](liquid-cooled: R_θ_idle ≈ R_θ_load)[/dim]" if _strategy == "coolant_inlet" else "")
-            + f".\n"
-            f"  [dim]Accuracy is lower than an observed idle window. "
-            f"Re-run without --ambient during a maintenance window for best results.[/dim]\n"
+            + ".\n"
+            "  [dim]Accuracy is lower than an observed idle window. "
+            "Re-run without --ambient during a maintenance window for best results.[/dim]\n"
         )
     else:
         console.print("[bold cyan]Phase 1 — Idle[/bold cyan]")
@@ -884,6 +883,145 @@ def serve(
     agent = ThetaAgent(cfg)
     console.print(f"[green]Metrics:[/green] http://localhost:{port}/metrics")
     asyncio.run(agent.run())
+
+
+# ── analyze-export (partner telemetry) ───────────────────────────────────────
+
+@app.command(name="analyze-export")
+def analyze_export(
+    path: str = typer.Argument(..., help="Telemetry export: a .csv file, or a dir/file of Prometheus query_range JSON."),
+    fmt: str = typer.Option("auto", "--format", "-f", help="auto | csv | prom"),
+    jobid: Optional[str] = typer.Option(None, "--jobid", help="Filter to one job id/label if the export holds several."),
+    label: Optional[str] = typer.Option(None, "--label", help="Display label for the report."),
+    out_json: Optional[str] = typer.Option(None, "--json", help="Also write the machine-readable report here."),
+):
+    """
+    Analyze a partner's per-GPU telemetry export end-to-end: R_θ + peer-relative
+    detection + signature-matrix cause attribution. The deliverable you send back.
+
+    Accepts a CSV (flexible columns) or Prometheus query_range JSON. Detection is
+    peer-relative so the absolute ambient assumption never affects which units
+    flag; cause attribution uses the fleet-relative T-vs-P decomposition.
+    """
+    from .agent.jobreport import load_csv, load_exports
+    from .agent.partner_report import analyze
+
+    src = Path(path)
+    if not src.exists():
+        console.print(f"[red]Not found:[/red] {path}")
+        raise typer.Exit(1)
+
+    kind = fmt
+    if kind == "auto":
+        kind = "csv" if src.is_file() and src.suffix.lower() == ".csv" else "prom"
+
+    if kind == "csv":
+        aligned = load_csv([src], jobid=jobid)
+    else:
+        paths = sorted(src.glob("*.json")) if src.is_dir() else [src]
+        aligned = load_exports(paths, jobid=jobid)
+
+    if not aligned:
+        console.print("[yellow]No per-GPU series found in the export.[/] "
+                      "Check column mapping (CSV) or that T/P/util are all present.")
+        raise typer.Exit(1)
+
+    lbl = label or jobid or src.name
+    report, attributions, text = analyze(aligned, label=lbl)
+    console.print(text)
+
+    if out_json:
+        payload = {
+            "label": lbl,
+            "method": report.method,
+            "fleet_mean_r": report.fleet_mean_r,
+            "n_gpus": len(report.gpus),
+            "nodes": report.nodes,
+            "units": [
+                {
+                    "key": a.key, "tier": a.tier, "robust_z": round(a.robust_z, 2),
+                    "t_mean": a.stat.t_mean if a.stat else None,
+                    "p_mean": a.stat.p_mean if a.stat else None,
+                    "attribution": a.verdict.as_dict(),
+                }
+                for a in attributions
+            ],
+        }
+        Path(out_json).write_text(json.dumps(payload, indent=2))
+        console.print(f"\n[green]Wrote[/green] {out_json}")
+
+
+# ── incidents ───────────────────────────────────────────────────────────────
+
+@app.command()
+def incidents(
+    show: Optional[str] = typer.Argument(None, help="Incident id to show in full; omit to list."),
+    pending: bool = typer.Option(False, "--pending", help="Only resolved incidents awaiting a label."),
+    path: Optional[str] = typer.Option(None, "--store", help="Incident store path (default ~/.theta/incidents.jsonl)."),
+):
+    """List tracked GPU incidents, or show one in full. The flywheel ledger."""
+    from .agent.incident_store import IncidentStore
+
+    store = IncidentStore(path)
+
+    if show:
+        inc = store.get(show)
+        if inc is None:
+            console.print(f"[red]No incident with id[/red] {show}")
+            raise typer.Exit(code=1)
+        console.print_json(json.dumps(inc.to_dict()))
+        return
+
+    rows = store.unlabeled_resolved() if pending else store.all()
+    acc = store.accuracy()
+    if acc["rate"] is None:
+        console.print("[dim]Measured cause accuracy: not earned yet (0 labeled incidents).[/dim]")
+    else:
+        console.print(
+            f"[bold]Measured cause accuracy:[/bold] {acc['correct']}/{acc['labeled']} "
+            f"= {acc['rate']:.0%} [dim](labeled incidents only)[/dim]"
+        )
+    if not rows:
+        console.print("[dim]No incidents.[/dim]")
+        return
+
+    table = Table(box=box.SIMPLE)
+    for col in ("id", "gpu", "node", "cause", "tier", "stage", "label"):
+        table.add_column(col)
+    for inc in rows:
+        table.add_row(
+            inc.id, str(inc.gpu_index), inc.node, inc.cause,
+            inc.effective_tier, inc.stage, inc.confirmed_label or "—",
+        )
+    console.print(table)
+
+
+# ── label ─────────────────────────────────────────────────────────────────────
+
+@app.command()
+def label(
+    incident_id: str = typer.Argument(..., help="Incident id (from `theta incidents`)."),
+    cause: str = typer.Argument(..., help="Confirmed cause, e.g. tim_degradation, airflow_blockage, fabric_link."),
+    notes: Optional[str] = typer.Option(None, "--notes", "-n", help="What the inspection/repair found."),
+    path: Optional[str] = typer.Option(None, "--store", help="Incident store path."),
+):
+    """
+    Attach an operator-confirmed ground-truth label to an incident.
+
+    This is the only action that elevates an incident to CONFIRMED_CAUSE — it is
+    how Theta's accuracy becomes a measured number instead of a physics prior.
+    """
+    from .agent.incident_store import IncidentStore
+
+    store = IncidentStore(path)
+    inc = store.label(incident_id, cause, now=time.time(), notes=notes)
+    if inc is None:
+        console.print(f"[red]No incident with id[/red] {incident_id}")
+        raise typer.Exit(code=1)
+
+    verdict = inc.prediction_was_correct
+    mark = "[green]✓ matched Theta's prediction[/green]" if verdict else "[yellow]≠ differed from Theta's prediction[/yellow]"
+    console.print(f"Labeled {incident_id}: predicted [bold]{inc.cause}[/bold], confirmed [bold]{cause}[/bold] — {mark}")
 
 
 if __name__ == "__main__":

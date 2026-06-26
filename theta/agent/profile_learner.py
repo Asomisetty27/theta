@@ -55,12 +55,12 @@ class ProfileMeasurement:
         lines = [
             f"# Profile upgrade ready for GPU {self.gpu_index} ({self.gpu_name})",
             f"# Measured from {self.n_samples} steady-state load windows.",
-            f"# Update hw_profiles.py entry for this GPU family:",
+            "# Update hw_profiles.py entry for this GPU family:",
             f"    rtheta_expected_under_load = {self.rtheta_mean},",
             f"    rtheta_expected_idle       = {self.rtheta_mean},  # flat — liquid-cooled",
             f"    rtheta_load_threshold      = {self.warn_threshold},",
             f"    rtheta_idle_threshold      = {self.warn_threshold},",
-            f"    confidence                 = 'measured',  # was: extrapolated",
+            "    confidence                 = 'measured',  # was: extrapolated",
             f"# Then run: theta calibrate --gpu {self.gpu_index}",
         ]
         return "\n".join(lines)

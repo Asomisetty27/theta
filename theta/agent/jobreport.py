@@ -74,9 +74,12 @@ class JobReport:
 
 def _metric_kind(name: str) -> Optional[str]:
     n = name.lower()
-    if "temperature" in n:               return "T"
-    if "power" in n:                     return "P"
-    if "duty_cycle" in n or "util" in n: return "U"
+    if "temperature" in n:
+        return "T"
+    if "power" in n:
+        return "P"
+    if "duty_cycle" in n or "util" in n:
+        return "U"
     return None
 
 
@@ -149,6 +152,92 @@ def load_prometheus(prom_url: str, jobid: str, start: float, end: float,
     return _align(series)
 
 
+_CSV_DEFAULT_COLS = {
+    "timestamp": ("timestamp", "time", "ts", "datetime"),
+    "node":      ("node", "hostname", "host", "instance"),
+    "gpu":       ("gpu", "gpu_index", "gpu_uuid", "uuid", "minor_number", "ordinal", "index"),
+    "temp":      ("temp", "temperature", "gpu_temp", "temperature_celsius", "nvidia_gpu_temperature_celsius"),
+    "power":     ("power", "power_w", "power_watts", "power_usage", "nvidia_gpu_power_usage_milliwatts"),
+    "util":      ("util", "utilization", "duty_cycle", "gpu_util", "nvidia_gpu_duty_cycle"),
+    "jobid":     ("jobid", "job_id", "job", "job_label"),
+}
+
+
+def _resolve_columns(header: list[str], overrides: Optional[dict] = None) -> dict:
+    """Map logical fields → actual CSV column names (case-insensitive, with overrides)."""
+    lower = {h.lower().strip(): h for h in header}
+    resolved: dict = {}
+    for field_name, candidates in _CSV_DEFAULT_COLS.items():
+        if overrides and field_name in overrides:
+            resolved[field_name] = overrides[field_name]
+            continue
+        for c in candidates:
+            if c in lower:
+                resolved[field_name] = lower[c]
+                break
+    return resolved
+
+
+def load_csv(paths: list[Path], jobid: Optional[str] = None,
+             columns: Optional[dict] = None, power_unit: str = "auto") -> dict:
+    """
+    Load a per-GPU telemetry CSV into the same aligned shape as `load_exports`.
+
+    Flexible columns (case-insensitive, override via `columns`): timestamp, node,
+    gpu (index or UUID), temp °C, power, util %, optional jobid. Non-integer GPU
+    ids (UUIDs) are assigned stable per-node ordinals in first-seen order so the
+    position-conditioned comparison still works.
+
+    power_unit: "W", "mW", or "auto" (guess from magnitude — values >5000 ⇒ mW).
+    """
+    import csv
+
+    series: dict = {}
+    uuid_ord: dict[tuple[str, str], int] = {}   # (node, raw_gpu) → ordinal
+    node_next_ord: dict[str, int] = {}
+
+    for p in paths:
+        with Path(p).open(newline="") as fh:
+            reader = csv.DictReader(fh)
+            cols = _resolve_columns(reader.fieldnames or [], columns)
+            missing = [f for f in ("node", "gpu", "temp", "power") if f not in cols]
+            if missing:
+                raise ValueError(f"CSV {p} missing required column(s) {missing}; "
+                                 f"saw {reader.fieldnames}. Pass --columns to map them.")
+            for row in reader:
+                if jobid is not None and "jobid" in cols:
+                    if str(row.get(cols["jobid"], "")) != str(jobid):
+                        continue
+                node = str(row[cols["node"]]).split(":")[0].replace("della-", "").strip()
+                raw_gpu = str(row[cols["gpu"]]).strip()
+                try:
+                    ordn = int(raw_gpu)
+                except ValueError:
+                    key = (node, raw_gpu)
+                    if key not in uuid_ord:
+                        uuid_ord[key] = node_next_ord.get(node, 0)
+                        node_next_ord[node] = node_next_ord.get(node, 0) + 1
+                    ordn = uuid_ord[key]
+                try:
+                    ts = int(float(row[cols["timestamp"]])) if "timestamp" in cols else len(
+                        series.get((node, ordn), {}).get("T", {}))
+                    temp = float(row[cols["temp"]])
+                    power = float(row[cols["power"]])
+                    util = float(row[cols["util"]]) if "util" in cols else 100.0
+                except (TypeError, ValueError):
+                    continue
+                # Normalize power to milliwatts (so _align's mW→W applies uniformly).
+                if power_unit == "mW" or (power_unit == "auto" and power > 5000):
+                    pass  # already mW
+                else:
+                    power *= 1000.0
+                d = series.setdefault((node, ordn), {"T": {}, "P": {}, "U": {}})
+                d["T"][ts] = temp
+                d["P"][ts] = power
+                d["U"][ts] = util
+    return _align(series)
+
+
 def _align(series: dict) -> dict:
     """Intersect timestamps across T/P/U per GPU; convert power mW→W."""
     out = {}
@@ -184,7 +273,8 @@ def steady_rtheta(aligned: dict, ambient: float = DEFAULT_AMBIENT_C) -> list[Gpu
         for T, P in zip(d["T"][warm_start:], powers):
             if P > load_thresh and P > 0:
                 rs.append((T - ambient) / P)
-                ts.append(T); ps.append(P)
+                ts.append(T)
+                ps.append(P)
         if len(rs) < MIN_STEADY:
             continue
         stats.append(GpuJobStat(

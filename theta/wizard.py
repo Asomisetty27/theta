@@ -168,7 +168,7 @@ def step_system_check() -> dict:
             results["n_gpus"] = n
             results["driver"] = driver
         except _NVMLPermissionError:
-            import getpass as _gp, os as _os
+            import getpass as _gp
             user = _gp.getuser()
             results["nvml"] = False
             results["n_gpus"] = 4
@@ -189,9 +189,9 @@ def step_system_check() -> dict:
             results["nvml_block"] = "driver"
             warn("NVIDIA driver not loaded — is this a GPU-equipped machine?")
             console.print(
-                f"  [dim]If you have an NVIDIA GPU, check: [bold]nvidia-smi[/bold]\n"
-                f"  If the driver is installed but not loaded, try: [bold]sudo modprobe nvidia[/bold]\n"
-                f"  Theta will run in demo mode on this machine.[/dim]"
+                "  [dim]If you have an NVIDIA GPU, check: [bold]nvidia-smi[/bold]\n"
+                "  If the driver is installed but not loaded, try: [bold]sudo modprobe nvidia[/bold]\n"
+                "  Theta will run in demo mode on this machine.[/dim]"
             )
         except ImportError:
             warn("pynvml not installed — install it with: pip install nvidia-ml-py")
@@ -743,7 +743,7 @@ def step_finish(sys_info: dict, gpus: list[dict], baselines: dict, alert_cfg: di
         f"  [bold {YELLOW}]theta calibrate --gpu 0[/]   [dim]— measure YOUR hardware's R_θ "
         f"(recommended — non-T4 detected)[/]\n"
         if non_t4 else
-        f"  [dim]theta calibrate --gpu 0[/]  [dim]— measure hardware-specific R_θ thresholds[/]\n"
+        "  [dim]theta calibrate --gpu 0[/]  [dim]— measure hardware-specific R_θ thresholds[/]\n"
     )
     console.print(Panel(
         f"  [bold {TEXT}]Start monitoring:[/]\n\n"

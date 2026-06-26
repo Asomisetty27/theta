@@ -34,6 +34,12 @@ _FI_DEV_PCIE_TX_THROUGHPUT    = 1009   # PCIe TX (KiB/s)
 _FI_DEV_PCIE_RX_THROUGHPUT    = 1010   # PCIe RX (KiB/s)
 _FI_PROF_GR_ENGINE_ACTIVE     = 1001   # SM engine active fraction (DCGM PROF group)
 _FI_PROF_DRAM_ACTIVE          = 1005   # DRAM engine active fraction (DCGM PROF group)
+# Throttle-cause accounting — the fields that let us attribute clock loss to
+# thermal vs power without computing R_theta. 241/240 are accumulating per-cause
+# throttle-time counters; 112 is the clock-event reason bitmask.
+_FI_DEV_THERMAL_VIOLATION     = 241    # accumulated thermal-throttle time
+_FI_DEV_POWER_VIOLATION       = 240    # accumulated power-throttle time
+_FI_DEV_CLOCK_EVENT_REASONS   = 112    # clock-event reason bitmask (HW/SW thermal vs power-cap)
 
 _FIELD_IDS = [
     _FI_DEV_NVLINK_CRC_DATA_ERR,
@@ -42,6 +48,9 @@ _FIELD_IDS = [
     _FI_DEV_PCIE_RX_THROUGHPUT,
     _FI_PROF_GR_ENGINE_ACTIVE,
     _FI_PROF_DRAM_ACTIVE,
+    _FI_DEV_THERMAL_VIOLATION,
+    _FI_DEV_POWER_VIOLATION,
+    _FI_DEV_CLOCK_EVENT_REASONS,
 ]
 
 
@@ -123,6 +132,9 @@ class DCGMEnricher:
                 "pcie_rx_kbps":     int(_val(_FI_DEV_PCIE_RX_THROUGHPUT)),
                 "gr_engine_active": float(_val(_FI_PROF_GR_ENGINE_ACTIVE, 0.0)),
                 "dram_active":      float(_val(_FI_PROF_DRAM_ACTIVE, 0.0)),
+                "thermal_violation_us":     int(_val(_FI_DEV_THERMAL_VIOLATION)),
+                "power_violation_us":       int(_val(_FI_DEV_POWER_VIOLATION)),
+                "dcgm_clock_event_reasons": int(_val(_FI_DEV_CLOCK_EVENT_REASONS)),
             }
         except Exception as e:
             log.debug(f"DCGM get_latest error gpu={gpu_index}: {e}")
@@ -141,6 +153,9 @@ class DCGMEnricher:
         object.__setattr__(sample, "pcie_rx_kbps",     data.get("pcie_rx_kbps",     0))
         object.__setattr__(sample, "gr_engine_active", data.get("gr_engine_active", 0.0))
         object.__setattr__(sample, "dram_active",      data.get("dram_active",      0.0))
+        object.__setattr__(sample, "thermal_violation_us",     data.get("thermal_violation_us",     0))
+        object.__setattr__(sample, "power_violation_us",       data.get("power_violation_us",       0))
+        object.__setattr__(sample, "dcgm_clock_event_reasons", data.get("dcgm_clock_event_reasons", 0))
 
     def shutdown(self) -> None:
         if self._handle:

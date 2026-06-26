@@ -34,7 +34,6 @@ time axis, cascading receptive field, PRAUC as primary metric).
 from __future__ import annotations
 
 import logging
-import math
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path

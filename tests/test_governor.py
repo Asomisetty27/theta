@@ -109,3 +109,65 @@ def test_counts_accumulate_for_export():
     _ready(gov, 0, 0.0)
     gov.evaluate(_alert(0, "drift", "warning", ts=1), ts=1)
     assert gov.counts["ROUTE"] == 1
+
+
+# ── Consensus gate ───────────────────────────────────────────────────────────
+# consensus_min=2: a sub-critical degradation warning must be corroborated by a
+# SECOND independent inferential detector before it routes. Critical bypasses.
+
+def test_consensus_holds_single_detector_warning():
+    gov = AlertGovernor(warmup_sec=0, consensus_min=2)
+    _ready(gov, 0, 0.0)
+    d = gov.evaluate(_alert(0, "drift", "warning", ts=10), ts=10)
+    assert d.action is Action.HOLD_CONSENSUS     # only drift has voted
+
+
+def test_consensus_routes_when_second_detector_corroborates():
+    gov = AlertGovernor(warmup_sec=0, consensus_min=2)
+    _ready(gov, 0, 0.0)
+    assert gov.evaluate(_alert(0, "drift", "warning", ts=10), ts=10).action is Action.HOLD_CONSENSUS
+    # A different inferential detector agrees within the window → routes.
+    d = gov.evaluate(_alert(0, "peer_relative", "warning", ts=12), ts=12)
+    assert d.action is Action.ROUTE
+
+
+def test_consensus_distinct_detectors_required_not_repeats():
+    gov = AlertGovernor(warmup_sec=0, consensus_min=2)
+    _ready(gov, 0, 0.0)
+    # Same detector firing twice is still one voter → still held.
+    assert gov.evaluate(_alert(0, "drift", "warning", ts=10), ts=10).action is Action.HOLD_CONSENSUS
+    assert gov.evaluate(_alert(0, "drift", "warning", ts=11), ts=11).action is Action.HOLD_CONSENSUS
+
+
+def test_consensus_critical_bypasses_gate():
+    gov = AlertGovernor(warmup_sec=0, consensus_min=2)
+    _ready(gov, 0, 0.0)
+    # A single critical inferential alert must route immediately — recall on
+    # severe events is never traded for the consensus gate.
+    d = gov.evaluate(_alert(0, "drift", "critical", ts=10, state=GPUState.CRITICAL), ts=10)
+    assert d.action is Action.ROUTE
+
+
+def test_consensus_votes_expire_outside_window():
+    gov = AlertGovernor(warmup_sec=0, consensus_min=2, consensus_window_sec=300)
+    _ready(gov, 0, 0.0)
+    assert gov.evaluate(_alert(0, "drift", "warning", ts=10), ts=10).action is Action.HOLD_CONSENSUS
+    # Second detector arrives long after the window → drift's vote expired, so
+    # this is again a lone voter and stays held.
+    d = gov.evaluate(_alert(0, "peer_relative", "warning", ts=10 + 400), ts=10 + 400)
+    assert d.action is Action.HOLD_CONSENSUS
+
+
+def test_consensus_min_one_is_passthrough():
+    gov = AlertGovernor(warmup_sec=0, consensus_min=1)   # default — disabled
+    _ready(gov, 0, 0.0)
+    d = gov.evaluate(_alert(0, "drift", "warning", ts=10), ts=10)
+    assert d.action is Action.ROUTE
+
+
+def test_consensus_ground_truth_never_gated():
+    gov = AlertGovernor(warmup_sec=0, consensus_min=2)
+    _ready(gov, 0, 0.0)
+    ecc = _alert(0, None, "critical", ts=10, state=GPUState.CRITICAL)
+    ecc.context = {"severity": "critical"}               # no detector tag = ground truth
+    assert gov.evaluate(ecc, ts=10).action is Action.ROUTE

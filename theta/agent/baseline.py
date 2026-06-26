@@ -24,11 +24,11 @@ import json
 import math
 import time
 from collections import deque
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Optional
 
-from .hw_profiles import ThermalProfile, resolve_profile
+from .hw_profiles import resolve_profile
 from .safeio import atomic_write_text
 
 def _default_baseline_file() -> Path:

@@ -53,6 +53,7 @@ class Action(Enum):
     HOLD_WARMING       = auto()   # GPU not yet confident — hold inferential alert
     SUPPRESS_INHIBITED = auto()   # a critical is active on this GPU
     SUPPRESS_BUDGET    = auto()   # FP-budget breaker tripped for this GPU
+    HOLD_CONSENSUS     = auto()   # only one inferential detector agrees so far — wait for a second
 
 
 @dataclass
@@ -70,6 +71,7 @@ class _GpuPosture:
     breaker_tripped: bool            = False
     breaker_since:   Optional[float] = None
     last_critical:   Optional[float] = None
+    votes:           dict            = field(default_factory=dict)   # detector name → last vote ts
 
 
 def _severity(event: AlertEvent) -> str:
@@ -102,12 +104,26 @@ class AlertGovernor:
         budget_window_sec: float = 3600.0,  # rolling budget window (1h)
         inhibit_sec:       float = 300.0,   # a critical inhibits lower-sev for this long
         breaker_cooldown:  float = 1800.0,  # breaker stays tripped this long, then re-arms
+        consensus_min:     int   = 1,       # distinct inferential detectors that must agree
+        consensus_window_sec: float = 300.0,  # window over which agreement counts
     ):
         self._warmup_sec        = warmup_sec
         self._budget_count      = budget_count
         self._budget_window_sec = budget_window_sec
         self._inhibit_sec       = inhibit_sec
         self._breaker_cooldown  = breaker_cooldown
+        # Consensus gate (Netdata-style unanimous-bit FP control, generalised to
+        # K-of-N). consensus_min=1 is pass-through (default — preserves the
+        # single-detector contract). The daemon raises it to 2 so a sub-critical
+        # degradation warning must be corroborated by a SECOND independent
+        # inferential detector (e.g. temporal drift AND cross-sectional peer, or
+        # AND median-polish / fault-curve / critic) before it routes. CRITICAL
+        # severities bypass the gate, so a worsening degradation still escalates
+        # immediately even from a single detector — the gate trades a little
+        # warning-latency for far fewer one-off false positives, never recall on
+        # severe events.
+        self._consensus_min        = max(1, consensus_min)
+        self._consensus_window_sec = consensus_window_sec
         self._gpus: dict[int, _GpuPosture] = {}
         # observability counters (exported by the daemon)
         self.counts = {a.name: 0 for a in Action}
@@ -174,6 +190,23 @@ class AlertGovernor:
                 and ts - p.last_critical < self._inhibit_sec:
             return self._done(Action.SUPPRESS_INHIBITED,
                               f"GPU {gpu} has an active critical — inhibiting {sev}")
+
+        # 3b. Consensus gate. Record this detector's vote, expire stale ones, and
+        # count how many DISTINCT inferential detectors agree within the window.
+        # A sub-critical degradation routes only once a second independent
+        # detector corroborates; CRITICAL bypasses (worsening events escalate
+        # immediately). consensus_min=1 makes this a no-op (default).
+        if detector:
+            p.votes[detector] = ts
+        for d, vts in list(p.votes.items()):
+            if ts - vts > self._consensus_window_sec:
+                del p.votes[d]
+        if self._consensus_min > 1 and sev != "critical" \
+                and len(p.votes) < self._consensus_min:
+            return self._done(
+                Action.HOLD_CONSENSUS,
+                f"GPU {gpu} {sev} from '{detector}' alone "
+                f"({len(p.votes)}/{self._consensus_min} detectors) — holding for corroboration")
 
         # 4. Budget accounting: record this inferential alert, prune the window.
         p.alert_times.append(ts)

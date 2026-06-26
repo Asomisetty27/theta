@@ -49,7 +49,7 @@ Guard rails (first-run trust > cleverness):
 from __future__ import annotations
 
 import statistics
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 # Robust-z thresholds. Deliberately conservative — E009's real degraded unit

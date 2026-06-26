@@ -32,11 +32,11 @@ context for future agent-to-agent communication.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from typing import Optional
 
-from .fault_classifier import FaultCause, FAULT_REMEDIATION
+from .fault_classifier import FaultCause
 from .metrics import GPUState
 
 
@@ -47,6 +47,47 @@ class Urgency(Enum):
     ACT_SOON    = "act_soon"    # action within current work week
     ACT_NOW     = "act_now"     # action within current shift
     EMERGENCY   = "emergency"   # immediate action; risk of data loss / fire
+
+
+class ConfidenceTier(Enum):
+    """
+    What *kind* of evidence backs a diagnosis — orthogonal to the numeric
+    `confidence`. Confidence says "how sure given what I see"; the tier says
+    "how that conclusion was reached", which is what actually governs how
+    strong a claim Theta is allowed to make.
+
+    This is the discipline behind the "no fake 100%" rule: Theta may never
+    assert a physical cause it has not confirmed. Passive telemetry tops out
+    at HIGH; CONFIRMED_* can only be reached by an active probe or a real
+    repair/inspection outcome — set later by the incident store, never by the
+    passive reasoning engine.
+
+        UNCONFIRMED         passive telemetry only, single/weak signal
+        PROBABLE            passive multi-signal agreement (peer + temporal, sustained)
+        HIGH                passive + an INDEPENDENT signal (ECC/XID/throttle/fabric/power)
+        CONFIRMED_SUBSYSTEM an active probe reproduced the expected fault signature
+        CONFIRMED_CAUSE     a repair/inspection/RMA validated it and the metrics recovered
+
+    The passive engine (`reason()`) only ever emits UNCONFIRMED / PROBABLE / HIGH.
+    """
+    UNCONFIRMED         = "unconfirmed"
+    PROBABLE            = "probable"
+    HIGH                = "high"
+    CONFIRMED_SUBSYSTEM = "confirmed_subsystem"
+    CONFIRMED_CAUSE     = "confirmed_cause"
+
+    @property
+    def rank(self) -> int:
+        return _TIER_RANK[self]
+
+
+_TIER_RANK: dict[ConfidenceTier, int] = {
+    ConfidenceTier.UNCONFIRMED:         0,
+    ConfidenceTier.PROBABLE:            1,
+    ConfidenceTier.HIGH:                2,
+    ConfidenceTier.CONFIRMED_SUBSYSTEM: 3,
+    ConfidenceTier.CONFIRMED_CAUSE:     4,
+}
 
 
 @dataclass
@@ -83,6 +124,8 @@ class CausalExplanation:
     alternatives: list[Hypothesis]
     evidence: list[Evidence]
     actions: list[Action]
+    # Epistemic status of the primary hypothesis — how strong a claim we may make
+    tier: ConfidenceTier = ConfidenceTier.UNCONFIRMED
     # Timeline fields are optional — we may not always have them
     when_started: Optional[str] = None     # human-readable, e.g. "12 minutes ago"
     eta_to_threshold: Optional[str] = None # "8 minutes" or None
@@ -93,6 +136,7 @@ class CausalExplanation:
         return {
             "headline": self.headline,
             "urgency": self.urgency.value,
+            "tier": self.tier.value,
             "hypothesis": {
                 "cause": self.hypothesis.cause.value,
                 "confidence": round(self.hypothesis.confidence, 3),
@@ -139,6 +183,8 @@ _HYPOTHESIS_LINES: dict[FaultCause, str] = {
     FaultCause.AIRFLOW_BLOCKAGE:  "Airflow path is obstructed — sudden R_θ step within a single session.",
     FaultCause.MOUNTING_EVENT:    "Heatsink mounting pressure shifted between sessions — likely after a service event.",
     FaultCause.HBM_THERMAL:       "HBM stacks are running hot under memory-bandwidth load — package thermal asymmetry.",
+    FaultCause.FABRIC_LINK:       "NVLink/PCIe error rate is elevated — comms path is degrading while temperatures look normal.",
+    FaultCause.POWER_DELIVERY:    "SM clock is being held down by power, not heat — power cap or delivery limit, R_θ within band.",
     FaultCause.INSUFFICIENT_DATA: "Not enough samples across power tiers to diagnose yet.",
 }
 
@@ -151,8 +197,8 @@ def _slurm_drain_action(gpu_index: int) -> Action:
     return Action(
         title=f"Drain GPU {gpu_index} from the SLURM queue",
         detail=(
-            f"Run `scontrol update nodename=$(hostname) state=drain reason='theta:r_theta_drift'`. "
-            f"In-flight jobs complete; new jobs route around this GPU."
+            "Run `scontrol update nodename=$(hostname) state=drain reason='theta:r_theta_drift'`. "
+            "In-flight jobs complete; new jobs route around this GPU."
         ),
         effort="30s — automatic if SLURM webhook is wired",
         expected_impact="Prevents new workload from compounding the thermal issue.",
@@ -165,8 +211,8 @@ def _k8s_cordon_action(gpu_index: int) -> Action:
     return Action(
         title=f"Cordon node hosting GPU {gpu_index}",
         detail=(
-            f"`kubectl cordon $(hostname)` — marks the node unschedulable. "
-            f"Existing pods continue; new pod scheduling skips this node."
+            "`kubectl cordon $(hostname)` — marks the node unschedulable. "
+            "Existing pods continue; new pod scheduling skips this node."
         ),
         effort="30s — automatic if cluster admission webhook is wired",
         expected_impact="Prevents new pods from landing on the degrading hardware.",
@@ -275,6 +321,84 @@ def _hbm_workload_action() -> Action:
     )
 
 
+def _check_fabric_action(gpu_index: int) -> Action:
+    return Action(
+        title=f"Inspect NVLink/PCIe link health on GPU {gpu_index}",
+        detail=(
+            f"Check `nvidia-smi nvlink -e -i {gpu_index}` for CRC/replay/recovery "
+            f"counts and `nvidia-smi -q -i {gpu_index} | grep -A6 'PCI'` for replay "
+            f"errors. Reseat the link / cable if counts climb; a degrading NVLink "
+            f"silently caps collective-comms throughput while every temperature "
+            f"graph stays green."
+        ),
+        effort="10m — counters first, reseat if a maintenance window opens",
+        expected_impact="Restores full link bandwidth; stops silent throughput loss on multi-GPU jobs.",
+        blocks_workload=False,
+    )
+
+
+def _check_power_action(gpu_index: int) -> Action:
+    return Action(
+        title=f"Check power cap and delivery on GPU {gpu_index}",
+        detail=(
+            f"Confirm the enforced limit with `nvidia-smi -q -i {gpu_index} -d POWER`. "
+            f"If clocks are pinned below boost while temperature is in-band, the GPU "
+            f"is power-limited, not heat-limited — verify the cap is intentional and "
+            f"that PSU/board power delivery has headroom."
+        ),
+        effort="5m",
+        expected_impact="Distinguishes an intended cap from a delivery fault; recovers clocks if mis-set.",
+        blocks_workload=False,
+    )
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Non-thermal subsystem thresholds (fabric / power). Inputs are normalized
+# rates the daemon derives from the collector's existing counters, so these
+# are unit-light and conservative — they exist to surface a subsystem, not to
+# fire on noise. Tune against real fleet data as labels accumulate.
+# ──────────────────────────────────────────────────────────────────────────
+FABRIC_ERR_PER_S   = 1.0    # NVLink CRC+recovery (or PCIe replay) errors/sec sustained
+PCIE_REPLAY_PER_S  = 1.0    # PCIe replays/sec sustained
+CLOCK_EFF_LOW      = 0.90   # sm_clock / sm_clock_max below this = clocks suppressed
+POWER_VIOL_FRAC    = 0.10   # fraction of recent window spent power-throttled
+RTHETA_IN_BAND     = 2.0    # |k_sigma| below this = thermals are NOT the story
+
+
+def _assess_tier(
+    *,
+    fault_cause: FaultCause,
+    rtheta_k_sigma: float,
+    rtheta_trend_per_min: float,
+    correlated_gpus: tuple[int, ...],
+    independent_signal: bool,
+) -> ConfidenceTier:
+    """
+    Classify the epistemic strength of a passive diagnosis. The passive engine
+    can never exceed HIGH — CONFIRMED_SUBSYSTEM/CONFIRMED_CAUSE require a probe
+    or a real repair outcome and are set later by the incident store.
+
+      HIGH       an INDEPENDENT instrument corroborates R_θ (ECC/throttle/fabric/power)
+      PROBABLE   passive multi-signal agreement (strong σ + peer drift or sustained trend)
+      UNCONFIRMED a single passive signal, or no real fault to claim
+    """
+    # No fault asserted → never make a claim.
+    if fault_cause in (FaultCause.NOMINAL, FaultCause.INSUFFICIENT_DATA) and not independent_signal:
+        return ConfidenceTier.UNCONFIRMED
+
+    # A second, physically-distinct instrument agreeing is the bar for HIGH.
+    if independent_signal:
+        return ConfidenceTier.HIGH
+
+    # Two passive views (peer cross-section + temporal) agreeing → PROBABLE.
+    sustained_trend = abs(rtheta_trend_per_min) * 600 >= 1.0
+    strong_sigma = abs(rtheta_k_sigma) >= 3.0
+    if strong_sigma and (bool(correlated_gpus) or sustained_trend):
+        return ConfidenceTier.PROBABLE
+
+    return ConfidenceTier.UNCONFIRMED
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Reasoning entry point
 # ──────────────────────────────────────────────────────────────────────────
@@ -296,6 +420,12 @@ def reason(
     micro_throttle: bool = False,
     correlated_gpus: tuple[int, ...] = (),
     fleet_cause_hint: Optional[str] = None,
+    # Non-thermal subsystem signals — normalized rates from collector counters.
+    # All default to "healthy" so existing callers are unaffected.
+    nvlink_error_rate: float = 0.0,       # NVLink CRC+recovery errors per second
+    pcie_replay_rate: float = 0.0,        # PCIe replays per second
+    clock_efficiency: float = 1.0,        # sm_clock / sm_clock_max, 1.0 = at boost
+    power_violation_rate: float = 0.0,    # fraction of recent window power-throttled (0..1)
 ) -> CausalExplanation:
     """
     Synthesize a CausalExplanation from the agent's signal bundle.
@@ -309,7 +439,49 @@ def reason(
       - micro-throttle present → at least WATCH
       - fleet correlation present → escalate one level
       - smoothed_state is ZOMBIE_RECOVERY → ACT_SOON minimum
+
+    Fabric/power signals can surface a non-thermal cause (FABRIC_LINK,
+    POWER_DELIVERY). When the thermal classifier reports NOMINAL/INSUFFICIENT
+    but a non-thermal subsystem is degrading, the non-thermal cause is promoted
+    to primary so Theta does not headline "nominal" while throughput silently
+    bleeds out of a failing link.
     """
+    # ── Non-thermal subsystem detection (fabric / power) ──
+    fabric_degraded = (
+        nvlink_error_rate >= FABRIC_ERR_PER_S or pcie_replay_rate >= PCIE_REPLAY_PER_S
+    )
+    # Power-limited == clocks held down AND power-throttle present AND thermals in band.
+    power_limited = (
+        clock_efficiency < CLOCK_EFF_LOW
+        and power_violation_rate >= POWER_VIOL_FRAC
+        and abs(rtheta_k_sigma) < RTHETA_IN_BAND
+    )
+
+    nonthermal: list[Hypothesis] = []
+    if fabric_degraded:
+        worst = max(nvlink_error_rate, pcie_replay_rate)
+        nonthermal.append(Hypothesis(
+            cause=FaultCause.FABRIC_LINK,
+            confidence=min(0.85, 0.5 + 0.1 * worst),
+            one_line=_HYPOTHESIS_LINES[FaultCause.FABRIC_LINK],
+        ))
+    if power_limited:
+        nonthermal.append(Hypothesis(
+            cause=FaultCause.POWER_DELIVERY,
+            confidence=min(0.80, 0.5 + (CLOCK_EFF_LOW - clock_efficiency)),
+            one_line=_HYPOTHESIS_LINES[FaultCause.POWER_DELIVERY],
+        ))
+    nonthermal.sort(key=lambda h: h.confidence, reverse=True)
+
+    # ── Effective primary cause (promote non-thermal when thermal path is clean) ──
+    effective_cause = fault_cause
+    effective_conf = fault_confidence
+    promoted: Optional[Hypothesis] = None
+    if fault_cause in (FaultCause.NOMINAL, FaultCause.INSUFFICIENT_DATA) and nonthermal:
+        promoted = nonthermal[0]
+        effective_cause = promoted.cause
+        effective_conf = promoted.confidence
+
     # ── Urgency calculation ──
     urgency = _compute_urgency(
         rtheta_k_sigma=rtheta_k_sigma,
@@ -318,11 +490,14 @@ def reason(
         smoothed_state=smoothed_state,
         fleet_correlation=bool(correlated_gpus),
     )
+    # A degrading non-thermal subsystem is at least worth a WATCH even when R_θ is calm.
+    if (fabric_degraded or power_limited) and urgency == Urgency.INFO:
+        urgency = Urgency.WATCH
 
     # ── Headline ──
     headline = _compose_headline(
         gpu_index=gpu_index,
-        fault_cause=fault_cause,
+        fault_cause=effective_cause,
         rtheta_k_sigma=rtheta_k_sigma,
         smoothed_state=smoothed_state,
         ecc_dbit_any=ecc_dbit_any,
@@ -331,11 +506,13 @@ def reason(
 
     # ── Hypothesis + alternatives ──
     primary = Hypothesis(
-        cause=fault_cause,
-        confidence=fault_confidence,
-        one_line=_HYPOTHESIS_LINES.get(fault_cause, "Cause undetermined."),
+        cause=effective_cause,
+        confidence=effective_conf,
+        one_line=_HYPOTHESIS_LINES.get(effective_cause, "Cause undetermined."),
     )
     alternatives: list[Hypothesis] = []
+    # Surface non-thermal hypotheses we didn't promote to primary.
+    alternatives.extend(h for h in nonthermal if h is not promoted)
     # If fleet correlation suggests a chassis/rack-level cause, surface that
     # as an alternative even when the fault_classifier hasn't escalated.
     if correlated_gpus and fault_cause not in (FaultCause.AIRFLOW_BLOCKAGE,):
@@ -378,14 +555,47 @@ def reason(
         micro_throttle=micro_throttle,
         correlated_gpus=correlated_gpus,
     )
+    if fabric_degraded:
+        evidence.append(Evidence(
+            name="fabric_errors",
+            value=(
+                f"NVLink errors {nvlink_error_rate:.2f}/s, PCIe replays "
+                f"{pcie_replay_rate:.2f}/s — independent of R_θ"
+            ),
+            weight=0.8,
+        ))
+    if power_limited:
+        evidence.append(Evidence(
+            name="power_limited_clocks",
+            value=(
+                f"SM clock at {clock_efficiency:.0%} of boost with "
+                f"{power_violation_rate:.0%} of the window power-throttled, R_θ in band"
+            ),
+            weight=0.75,
+        ))
 
     # ── Action ranking ──
     actions = _rank_actions(
         gpu_index=gpu_index,
-        fault_cause=fault_cause,
+        fault_cause=effective_cause,
         urgency=urgency,
         ecc_dbit_any=ecc_dbit_any,
         smoothed_state=smoothed_state,
+    )
+    # Non-thermal remediations for any surfaced subsystem (primary or alternative).
+    if fabric_degraded and not any(a.title.startswith("Inspect NVLink") for a in actions):
+        actions.append(_check_fabric_action(gpu_index))
+    if power_limited and not any(a.title.startswith("Check power cap") for a in actions):
+        actions.append(_check_power_action(gpu_index))
+
+    # ── Confidence tier (epistemic strength of the primary hypothesis) ──
+    independent_signal = ecc_dbit_any or micro_throttle or fabric_degraded or power_limited
+    tier = _assess_tier(
+        fault_cause=effective_cause,
+        rtheta_k_sigma=rtheta_k_sigma,
+        rtheta_trend_per_min=rtheta_trend_per_min,
+        correlated_gpus=correlated_gpus,
+        independent_signal=independent_signal,
     )
 
     # ── Timeline ──
@@ -398,6 +608,7 @@ def reason(
         alternatives=alternatives,
         evidence=evidence,
         actions=actions,
+        tier=tier,
         when_started=None,  # caller can fill from state machine if desired
         eta_to_threshold=eta_thr,
         eta_to_recovery=None,
@@ -476,6 +687,10 @@ def _compose_headline(
         return f"GPU {gpu_index}: heatsink mounting pressure shifted — likely post-service event."
     if fault_cause == FaultCause.HBM_THERMAL:
         return f"GPU {gpu_index}: HBM running hot under memory-bandwidth load."
+    if fault_cause == FaultCause.FABRIC_LINK:
+        return f"GPU {gpu_index}: NVLink/PCIe errors rising — comms degrading while thermals look normal."
+    if fault_cause == FaultCause.POWER_DELIVERY:
+        return f"GPU {gpu_index}: clocks power-limited, not heat-limited — check power cap / delivery."
     # Fallback — describe what we see even when no specific cause assigned
     return f"GPU {gpu_index}: R_θ {rtheta_k_sigma:.1f}σ above baseline (no specific cause assigned yet)."
 
