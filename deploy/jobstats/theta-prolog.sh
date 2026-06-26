@@ -14,24 +14,35 @@
 #   SLURM_STEP_ID — step ID (0 for job prolog)
 #
 
-set -euo pipefail
+# Best-effort: a prolog hook must NEVER block a job. We do not use `set -e`,
+# and we always exit 0. If a baseline can't be captured here, that's fine —
+# the daemon detects the real workload start via util spike anyway, which is
+# the whole point of this design (it sidesteps the prolog-timing problem).
+set -o pipefail 2>/dev/null || true
 
-JOBID="${SLURM_JOBID:?job_id_required}"
-NODE="$(hostname -s)"
-TIMESTAMP="$(date -u +%s.%N)"
+# JOBID is the only thing we truly need to name the report. Default it rather
+# than abort, so a misconfigured environment still doesn't block scheduling.
+JOBID="${SLURM_JOBID:-unknown_$(date +%s 2>/dev/null || echo 0)}"
+NODE="$(hostname -s 2>/dev/null || hostname 2>/dev/null || echo unknown)"
+TIMESTAMP="$(date -u +%s.%N 2>/dev/null || echo 0)"
+
+# GPU set. SLURM exposes this under several names depending on version/config;
+# fall back through the common ones, then to CUDA_VISIBLE_DEVICES.
+GPU_SET="${SLURM_GPUS:-${SLURM_JOB_GPUS:-${GPU_DEVICE_ORDINAL:-${CUDA_VISIBLE_DEVICES:-}}}}"
 
 # Temporary working directory for this job's state
 JOB_TMPDIR="/tmp/theta_job_${JOBID}"
-mkdir -p "$JOB_TMPDIR"
+mkdir -p "$JOB_TMPDIR" 2>/dev/null || true
 
 # Query current R_theta baseline from Theta's health API
 # Default endpoint: localhost:7777 (can be overridden via env var)
 HEALTH_API_ENDPOINT="${THETA_HEALTH_API_ENDPOINT:-http://localhost:7777}"
 
-# Parse SLURM_GPUS into array
-# SLURM_GPUS format varies: could be "0,1,2" or "0:1:2" or "[0-1]"
+# Parse a GPU set string into one index per line.
+# Format varies: "0,1,2" or "0:1:2" or "[0-1]" or "" (no GPUs).
 parse_gpus() {
-    local gpu_str="${1:?}"
+    local gpu_str="${1:-}"
+    [ -z "$gpu_str" ] && return 0
     # Handle bracket notation like [0-1] → 0,1
     if [[ "$gpu_str" =~ \[([0-9]+)-([0-9]+)\] ]]; then
         local start="${BASH_REMATCH[1]}"
@@ -71,12 +82,14 @@ get_baselines() {
     done
 }
 
-# Main
-GPU_ARRAY=($(parse_gpus "$SLURM_GPUS"))
-echo "jobid=$JOBID" > "$JOB_TMPDIR/metadata"
-echo "node=$NODE" >> "$JOB_TMPDIR/metadata"
-echo "start_time=$TIMESTAMP" >> "$JOB_TMPDIR/metadata"
-echo "gpu_count=${#GPU_ARRAY[@]}" >> "$JOB_TMPDIR/metadata"
+# Main — everything below is best-effort; the script always exits 0.
+GPU_ARRAY=($(parse_gpus "$GPU_SET"))
+{
+    echo "jobid=$JOBID"
+    echo "node=$NODE"
+    echo "start_time=$TIMESTAMP"
+    echo "gpu_count=${#GPU_ARRAY[@]}"
+} > "$JOB_TMPDIR/metadata" 2>/dev/null || true
 
 # Write baselines to file (best-effort; failures don't block job)
 {
@@ -91,6 +104,6 @@ echo "gpu_count=${#GPU_ARRAY[@]}" >> "$JOB_TMPDIR/metadata"
 } > "$JOB_TMPDIR/baselines" 2>/dev/null || true
 
 # Log for debugging (stdout goes to slurm log)
-echo "[Theta] Job $JOBID prolog — GPUs=${GPU_ARRAY[*]} node=$NODE" >&2
+echo "[Theta] Job $JOBID prolog — GPUs=${GPU_ARRAY[*]:-none} node=$NODE" >&2
 
 exit 0

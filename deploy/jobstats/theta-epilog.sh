@@ -14,7 +14,10 @@
 #   SLURM_JOB_NUM_NODES — number of allocated nodes
 #
 
-set -euo pipefail
+# Best-effort: an epilog hook must NEVER fail the node over telemetry. We do
+# not use `set -e` — every step degrades gracefully and the script always
+# exits 0. `set -u` is also avoided so unset SLURM vars fall back to defaults.
+set -o pipefail 2>/dev/null || true
 
 JOBID="${SLURM_JOBID:?job_id_required}"
 TIMESTAMP="$(date -u +%s.%N)"
@@ -33,18 +36,18 @@ if [[ ! -f "$JOB_TMPDIR/metadata" ]]; then
     exit 0
 fi
 
-# Parse metadata
-mapfile -t metadata < "$JOB_TMPDIR/metadata"
-declare -A meta
-for line in "${metadata[@]}"; do
-    key="${line%=*}"
-    value="${line#*=}"
-    meta["$key"]="$value"
-done
-
-start_time="${meta[start_time]:-0}"
-node="${meta[node]:-unknown}"
-gpu_count="${meta[gpu_count]:-0}"
+# Parse metadata — portable to bash 3.2 (no mapfile / associative arrays).
+# Metadata is simple "key=value" lines written by the prolog.
+start_time="0"
+node="unknown"
+gpu_count="0"
+while IFS='=' read -r key value; do
+    case "$key" in
+        start_time) start_time="$value" ;;
+        node)       node="$value" ;;
+        gpu_count)  gpu_count="$value" ;;
+    esac
+done < "$JOB_TMPDIR/metadata"
 
 # Query final state from Theta health API (best-effort)
 final_metrics=""
@@ -53,8 +56,13 @@ if command -v curl &>/dev/null; then
         "${HEALTH_API_ENDPOINT}/api/v1/metrics" 2>/dev/null || echo "{}")
 fi
 
-# Compute duration
-duration=$(echo "$TIMESTAMP - $start_time" | bc -l 2>/dev/null || echo "0")
+# Compute duration. Use awk (POSIX, always present) with %.3f so the result
+# is always valid JSON — `bc` emits ".045" (no leading zero) for sub-second
+# values, which is NOT valid JSON and corrupts every consumer of the report.
+duration=$(awk "BEGIN { printf \"%.3f\", ${TIMESTAMP:-0} - ${start_time:-0} }" 2>/dev/null)
+case "$duration" in
+    ''|*[!0-9.-]*) duration="0" ;;   # fall back if awk produced nothing sane
+esac
 
 # Write job report (JSON format matching job_tracker.py output)
 # This is a simplified version; the full report is written by daemon.py's
