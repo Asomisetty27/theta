@@ -27,7 +27,7 @@ from typing import Optional
 
 import structlog
 
-from .collector  import NVMLCollector, CollectorConfig
+from .collector  import CollectorConfig
 from .metrics    import GPUState, ClassifiedSample, AlertEvent, enrich
 from .baseline   import BaselineManager
 from .window     import SteadyStateWindow, SIGMA_STRICT
@@ -54,6 +54,7 @@ from .profile_learner    import ProfileLearner
 from ..                  import __version__
 from .exporter   import PrometheusExporter
 from .otlp_exporter import OTLPExporter
+from .job_tracker import JobTracker
 
 log = structlog.get_logger(__name__)
 
@@ -159,10 +160,15 @@ class ThetaAgent:
         # First-run-trust + FP-budget layer. Every alert funnels through _emit(),
         # which gates inferential alerts through this governor (warming / inhibition
         # / budget breaker). Ground-truth hardware faults bypass it. See governor.py.
-        self._governor     = AlertGovernor()
+        # consensus_min=2: a sub-critical degradation warning must be corroborated
+        # by a second independent inferential detector (drift / peer / median-polish
+        # / fault-curve / critic) before it routes. Critical events bypass and fire
+        # immediately. Mirrors Netdata's unanimous-anomaly-bit FP control.
+        self._governor     = AlertGovernor(consensus_min=2)
         # Health-as-conditions: scheduler-facing level state (NPD pattern).
         self._health_conditions = HealthConditionTracker()
         self._peer_flag:      dict[int, tuple[bool, bool]] = {}   # gpu → (flagged, critical)
+        self._peer_z:         dict[int, float] = {}              # gpu → position-conditioned robust-z
         self._telemetry_stale: set[int] = set()                  # gpus with stale telemetry
         self._device_caps:    dict[int, object] = {}             # gpu → DeviceCapability (MIG/vGPU)
         self._no_rtheta:      set[int] = set()                   # gpus where R_θ is uncomputable
@@ -197,6 +203,29 @@ class ThetaAgent:
 
         # Poll latency tracking — rolling mean per GPU (for health API + observability)
         self._poll_latency_ema: dict[int, float] = {}
+
+        # Converts the collector's cumulative fabric/power counters into per-interval
+        # rates, which is what activates FABRIC_LINK / POWER_DELIVERY in the causal
+        # engine (raw cumulative counts would mislabel old, settled history as live).
+        from .rate_tracker import RateTracker
+        self._rate_tracker = RateTracker()
+
+        # Per-GPU R_θ(P) residual curves — accumulate (power, R_θ) so the α/β
+        # decomposition (offset vs conduction) sharpens cause attribution
+        # automatically once a workload spans a range of power. No probe needed.
+        from .rtheta_curve import RThetaResidualCurve
+        self._rtheta_curves: dict[int, RThetaResidualCurve] = {}
+
+        # Incident store — the flywheel substrate. Records each detected episode's
+        # before/after features and (once an operator labels it) ground truth, so
+        # Theta's accuracy can eventually be MEASURED rather than asserted. Strictly
+        # best-effort: any store failure must never disturb monitoring.
+        try:
+            from .incident_store import IncidentStore
+            self._incident_store: Optional[object] = IncidentStore()
+        except Exception as exc:   # pragma: no cover - defensive
+            log.warning("incident_store_init_failed", error=str(exc))
+            self._incident_store = None
         self._poll_latency_baseline: dict[int, float] = {}
         self._poll_latency_samples: dict[int, int] = {}
         self._poll_latency_alert_ts: dict[int, float] = {}
@@ -210,6 +239,9 @@ class ThetaAgent:
         # Per-GPU live state for SDC hunter cross-GPU validation
         self._gpu_util:  dict[int, float] = {}
         self._gpu_power: dict[int, float] = {}
+
+        # SLURM job tracking — per-job thermal provenance
+        self._job_tracker = JobTracker()
 
         # Health API — exposes /api/v1/health for SLURM prolog / MPI integration
         # and /api/v1/agent/* for the Agent Control Center site.
@@ -377,6 +409,17 @@ class ThetaAgent:
         if not enriched.rtheta_valid or enriched.rtheta is None:
             return
 
+        # 2b. Update job tracker (SLURM per-job thermal provenance)
+        # Tracks per-GPU R_theta baseline, max, energy, and thermal stress flags
+        if enriched.rtheta is not None:
+            self._job_tracker.update_gpu_sample(
+                gpu_index=gpu,
+                r_theta=enriched.rtheta,
+                power_w=raw_sample.power_w,
+                temperature_c=raw_sample.temp_junction,
+                utilization_pct=raw_sample.util_pct,
+            )
+
         # 3. Update steady-state window
         window = self._window.update(
             gpu, ts, enriched.rtheta,
@@ -510,12 +553,36 @@ class ThetaAgent:
                 # Populate the agent-details cache so the /api/v1/agent/gpu/{i}/details
                 # endpoint can serve rich state (causal explanation + maintenance score)
                 # to the site's Agent Control Center on every poll.
+                # Fabric/power rates (activate FABRIC_LINK / POWER_DELIVERY). Convert
+                # the collector's cumulative counters into per-interval rates; guarded
+                # so a tracker hiccup degrades to "no fabric/power signal", never a crash.
+                nvlink_rate = pcie_rate = pviol_rate = 0.0
+                clock_eff = 1.0
+                try:
+                    from .rate_tracker import clock_efficiency as _clk_eff
+                    rates = self._rate_tracker.update(
+                        gpu, ts,
+                        nvlink_errors=getattr(raw_sample, "nvlink_errors", 0),
+                        power_violation_us=getattr(raw_sample, "power_violation_us", 0),
+                    )
+                    nvlink_rate = rates.nvlink_error_rate
+                    pcie_rate = rates.pcie_replay_rate
+                    pviol_rate = rates.power_violation_rate
+                    clock_eff = _clk_eff(
+                        getattr(raw_sample, "clock_sm_mhz", 0),
+                        getattr(raw_sample, "sm_clock_max_mhz", 0),
+                    )
+                except Exception as exc:   # pragma: no cover - defensive
+                    log.warning("rate_tracker_failed", gpu=gpu, error=str(exc))
+
                 self._update_agent_details_cache(
                     gpu=gpu, ts=ts,
                     filtered=filtered, raw_state=raw_state, raw_confidence=raw_confidence,
                     fault=fault, window=window, drift=drift,
                     power_w=raw_sample.power_w, ecc_dbit=raw_sample.ecc_dbit,
                     inlet_temp_c=getattr(raw_sample, "inlet_temp_c", None),
+                    nvlink_error_rate=nvlink_rate, pcie_replay_rate=pcie_rate,
+                    clock_efficiency=clock_eff, power_violation_rate=pviol_rate,
                 )
                 if fault.cause not in (FaultCause.NOMINAL, FaultCause.INSUFFICIENT_DATA):
                     fault_alert = AlertEvent(
@@ -666,6 +733,8 @@ class ThetaAgent:
         self, *, gpu: int, ts: float, filtered, raw_state, raw_confidence,
         fault, window, drift, power_w: float, ecc_dbit: int,
         inlet_temp_c: Optional[float] = None,
+        nvlink_error_rate: float = 0.0, pcie_replay_rate: float = 0.0,
+        clock_efficiency: float = 1.0, power_violation_rate: float = 0.0,
     ) -> None:
         """Compose causal + maintenance state for one GPU and cache it.
 
@@ -709,11 +778,98 @@ class ThetaAgent:
                 ecc_dbit_any=ecc_dbit > 0,
                 micro_throttle=False,
                 correlated_gpus=(),
+                nvlink_error_rate=nvlink_error_rate,
+                pcie_replay_rate=pcie_replay_rate,
+                clock_efficiency=clock_efficiency,
+                power_violation_rate=power_violation_rate,
             )
             causal_dict = causal.as_dict()
         except Exception as exc:
             log.error("causal_reason_failed", gpu=gpu, error=str(exc))
             causal_dict = None
+
+        # ── Signature-matrix attribution (multi-axis fingerprint) ──
+        # Layers an honest exact-cause / cause-class / subsystem-level verdict
+        # plus a missing-axis ledger onto the causal narrative, using the
+        # Princeton-calibrated H100 reference. Guarded and additive: a failure
+        # leaves causal_dict untouched.
+        if causal_dict is not None:
+            try:
+                from .rtheta_curve import RThetaResidualCurve
+                from .signature import classify as signature_classify
+                from .signature_adapter import build_feature_vector
+                # Feed the residual curve so α/β sharpen as power range is seen.
+                curve_acc = self._rtheta_curves.setdefault(gpu, RThetaResidualCurve())
+                curve_acc.update(power_w, window.rtheta_mean)
+                fv = build_feature_vector(
+                    rtheta=window.rtheta_mean,
+                    power_w=power_w,
+                    fault_cause=fault.cause,
+                    peer_robust_z=self._peer_z.get(gpu),
+                    curve=curve_acc.decompose(),
+                    fault_drift_rate=getattr(fault, "drift_rate", None),
+                    fault_session_delta=getattr(fault, "session_delta", None),
+                    gpu_ordinal=gpu,
+                    correlated_gpus=(),
+                    nvlink_error_rate=nvlink_error_rate,
+                    pcie_replay_rate=pcie_replay_rate,
+                    power_violation_rate=power_violation_rate,
+                    clock_efficiency=clock_efficiency,
+                )
+                causal_dict["signature"] = signature_classify(fv).as_dict()
+            except Exception as exc:   # pragma: no cover - defensive
+                log.warning("signature_classify_failed", gpu=gpu, error=str(exc))
+
+        # ── Telemetry-integrity gate (Stage 1) ──
+        # If the data can't be trusted, block the diagnosis instead of narrating
+        # a number that may be garbage. Best-effort and guarded.
+        telemetry_ok = True
+        try:
+            from .integrity import IntegritySignals, assess_integrity, blocked_explanation
+            verdict = assess_integrity(IntegritySignals(
+                stale=(gpu in self._telemetry_stale),
+                poll_latency_s=self._poll_latency_ema.get(gpu, 0.0),
+                power_w=power_w,
+                rtheta_computable=(gpu not in self._no_rtheta),
+            ))
+            if verdict.blocked:
+                telemetry_ok = False
+                causal_dict = blocked_explanation(gpu, verdict)
+        except Exception as exc:   # pragma: no cover - defensive
+            log.warning("integrity_gate_failed", gpu=gpu, error=str(exc))
+
+        # ── Incident store update (the flywheel) ──
+        # Open an incident when a trustworthy diagnosis crosses the tracking bar,
+        # close it when the GPU returns to health. Skipped on blocked telemetry so
+        # we never record a phantom episode.
+        if telemetry_ok and causal_dict is not None and self._incident_store is not None:
+            try:
+                import socket
+                from .incident_store import update_from_diagnosis
+                gpu_name = (
+                    self._collector_gpu_names.get(gpu, "gpu")
+                    if hasattr(self, "_collector_gpu_names") else "gpu"
+                )
+                features = {
+                    "rtheta": _safe_float(window.rtheta_mean),
+                    "rtheta_baseline": _safe_float(drift.baseline_mean),
+                    "rtheta_k_sigma": _safe_float(drift.sigma_score),
+                    "intercept": fault.intercept,
+                    "gap": fault.gap,
+                    "curve_slope": getattr(fault, "curve_slope", None),
+                    "power_w": power_w,
+                }
+                update_from_diagnosis(
+                    self._incident_store,
+                    gpu_uuid=f"{gpu_name}#{gpu}",
+                    gpu_index=gpu,
+                    node=socket.gethostname(),
+                    causal_dict=causal_dict,
+                    features=features,
+                    now=ts,
+                )
+            except Exception as exc:   # pragma: no cover - defensive
+                log.warning("incident_update_failed", gpu=gpu, error=str(exc))
 
         # Maintenance score
         try:
@@ -823,7 +979,6 @@ class ThetaAgent:
         from .calibrate import CalibrationManager
         from .hw_profiles import resolve_or_default
 
-        import sys
         from rich.console import Console as _Console
         from rich.panel import Panel as _Panel
 
@@ -868,6 +1023,20 @@ class ThetaAgent:
             gpus=[{"slot": s, "name": n, "profile": c} for s, n, c in bad],
         )
         return False
+
+    async def _process_job_completions(self, ts: float) -> None:
+        """Periodically check for completed jobs and write thermal reports.
+
+        Called every 60 ticks (~5 minutes). Writes per-job JSON reports to
+        ~/.theta/job_<JOBID>.json when jobs are detected as complete
+        (via util drop or explicit SLURM epilog signal).
+        """
+        # For now, this is a no-op placeholder. In production, this would:
+        # 1. Check for jobs marked as complete by SLURM epilog
+        # 2. Write per-job thermal reports
+        # 3. Emit completion alerts if thermal stress detected
+        # See SLURM_INTEGRATION_PLAN.md Phase 2 for full flow.
+        pass
 
     def _reload_config(self) -> None:
         """Re-read ~/.theta/config.json and apply hot-reloadable fields.
@@ -990,6 +1159,9 @@ class ThetaAgent:
             # Carry current peer state into the health tracker for EVERY GPU
             # (not just the rate-limited alerts), so conditions stay accurate.
             self._peer_flag[gpu] = (r.is_anomaly, r.is_critical)
+            # Keep the position-conditioned robust-z for the signature adapter:
+            # it is the detector that catches a unit hidden in a cool HGX slot.
+            self._peer_z[gpu] = r.robust_z
             if not r.is_anomaly:
                 continue
             if ts - self._peer_alerted.get(gpu, 0.0) < self.PEER_ALERT_COOLDOWN_S:
@@ -1196,6 +1368,10 @@ class ThetaAgent:
                         # the current fleet snapshot. No-op on <4 matched-power
                         # peers (handled inside the detector).
                         await self._run_peer_detection(raw_sample.timestamp)
+
+                    # Job completion handling — check for finished jobs and write reports
+                    if self._tick_count % 60 == 0:
+                        await self._process_job_completions(raw_sample.timestamp)
 
                     # ── Self-improvement periodic tasks ───────────────────
                     # Profile upgrade check — every 100 ticks (~8 min)
