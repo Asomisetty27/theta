@@ -26,6 +26,40 @@ from .metrics import RawSample
 
 log = logging.getLogger(__name__)
 
+# Power-plausibility guard thresholds. A GPU under sustained heavy load must
+# draw a substantial fraction of its TDP; a reading far below that is almost
+# certainly a per-die NVML under-report on a dual-die part (e.g. B200 reports
+# one die's ~450 W of a ~900 W module), which would halve the R_θ denominator
+# and double R_θ — a spurious degradation signal.
+UNDERREPORT_LOAD_UTIL = 80.0   # only judge at clearly-heavy load
+UNDERREPORT_TDP_FRAC  = 0.5    # below 50% of TDP at heavy load ⇒ suspect
+
+
+def power_reading_suspect(
+    power_w: float,
+    util_pct: float,
+    idle_floor_w: float,
+    tdp_w: float,
+) -> Optional[str]:
+    """Return a reason string if a power reading is implausibly low, else None.
+
+    Two tiers, both targeting per-die NVML under-reporting on dual-die GPUs:
+      - "near_zero": power below 40% of the idle floor while active — one die
+        reads ~0 while the GPU is clearly working.
+      - "below_tdp_floor_at_load": power below 50% of TDP at sustained heavy
+        load — the fixed idle-floor gate (34 W on a B200) is far too low to
+        catch a 450 W per-die report on a 1000 W part, so scale to TDP.
+
+    A True result only ever DROPS the sample (R_θ not computed this tick); it
+    never raises an alert and cannot mask real degradation, because degradation
+    raises R_θ without lowering power draw.
+    """
+    if power_w < idle_floor_w * 0.4 and util_pct > 15.0:
+        return "near_zero"
+    if tdp_w > 0.0 and util_pct >= UNDERREPORT_LOAD_UTIL and power_w < tdp_w * UNDERREPORT_TDP_FRAC:
+        return "below_tdp_floor_at_load"
+    return None
+
 
 @dataclass
 class CollectorConfig:
@@ -195,20 +229,26 @@ class NVMLCollector:
         # to None (enrich() will mark rtheta_valid=False) rather than silently
         # emitting a bogus metric.
         power_f = float(power)
+        _util_pct = float(util.gpu)
         try:
             from .hw_profiles import resolve_or_default as _rp
             _prof = _rp(self._gpu_names[idx] if idx < len(self._gpu_names) else "")
             _idle_floor = _prof.idle_floor_w if _prof else 5.0
+            _tdp = _prof.tdp_w if _prof else 0.0
         except Exception:
-            _idle_floor = 5.0
-        if power_f < _idle_floor * 0.4 and float(util.gpu) > 15.0:
+            _idle_floor, _tdp = 5.0, 0.0
+
+        _suspect = power_reading_suspect(power_f, _util_pct, _idle_floor, _tdp)
+        if _suspect is not None:
             log.warning(
                 "power_reading_suspect",
                 gpu=idx,
                 power_w=power_f,
-                util_pct=float(util.gpu),
+                util_pct=_util_pct,
                 idle_floor_w=_idle_floor,
-                note="power < 40% of idle floor while utilization high — possible dual-die reporting issue; skipping R_θ for this sample",
+                tdp_w=_tdp,
+                reason=_suspect,
+                note="power implausibly low for load — possible per-die NVML reporting on dual-die GPU; skipping R_θ for this sample",
             )
             power_f = 0.0   # drives rtheta_valid=False in enrich()
 

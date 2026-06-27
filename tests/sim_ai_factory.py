@@ -477,27 +477,26 @@ HDR("SCENARIO 7 — B200 dual-die power reporting edge case")
 # GPU at 900W actual → NVML reports 450W
 suspicious_power = LOAD_POWER_W / 2.0
 
-# The new sanity check in collector.py skips when power < 0.4 * idle_floor_w while util > 15%.
-# idle_floor_w for B200 = 85W. Trigger: power < 34W while util > 15%.
+# The TDP-scaled sanity check in collector.py (power_reading_suspect) catches
+# per-die under-reporting: at util >= 80%, power below 50% of TDP is suspect.
+from theta.agent.collector import power_reading_suspect, UNDERREPORT_TDP_FRAC
 b200_idle_floor = profile.idle_floor_w
-trigger_threshold = b200_idle_floor * 0.4
+tdp_floor = profile.tdp_w * UNDERREPORT_TDP_FRAC
 print(f"\n  B200 idle_floor_w      = {b200_idle_floor} W")
-print(f"  Sanity check triggers at: power < {trigger_threshold:.1f} W while util > 15%")
+print(f"  TDP-scaled floor:         power < {tdp_floor:.0f} W while util >= 80% (50% of {profile.tdp_w:.0f}W TDP)")
 print(f"  Simulated NVML report:    power = {suspicious_power:.0f} W (half of actual {LOAD_POWER_W}W)")
 print(f"  Util during test:         90%")
 
-if suspicious_power < trigger_threshold:
-    OK("Sanity check WOULD fire — sample dropped ✓")
+_reason = power_reading_suspect(suspicious_power, 90.0, b200_idle_floor, profile.tdp_w)
+if _reason is not None:
+    OK(f"Sanity check fires ({_reason}) — sample dropped, no spurious R_θ ✓")
 else:
     r_suspicious, _ = compute_rtheta(T_J_LOAD, COOLANT_INLET_C, suspicious_power)
     if r_suspicious is not None:
         WARN(
             "Power underreporting NOT caught by sanity check",
-            f"Power={suspicious_power:.0f}W > trigger threshold={trigger_threshold:.1f}W. "
-            f"R_theta would be computed as {r_suspicious:.4f} C/W instead of "
-            f"{r_load_bmc:.4f} C/W — a {(r_suspicious/r_load_bmc - 1)*100:.0f}% overestimate. "
-            f"Per-die NVML reporting on B200 (450W each) would produce spurious drift alerts. "
-            f"Threshold needs tightening: consider power < 0.7 * idle_floor for B200."
+            f"Power={suspicious_power:.0f}W not flagged. "
+            f"R_theta would be {r_suspicious:.4f} C/W instead of {r_load_bmc:.4f} C/W."
         )
 
 
