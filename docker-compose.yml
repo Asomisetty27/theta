@@ -3,7 +3,7 @@ services:
   # ── Theta agent ──────────────────────────────────────────────────────────
   theta:
     build: .
-    image: runtheta/agent:latest
+    image: somisett/agent:latest
     restart: unless-stopped
     # GPU passthrough — requires nvidia-container-toolkit on the host.
     # Remove the `deploy` block if running without a GPU (demo mode kicks in).
