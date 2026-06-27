@@ -1038,6 +1038,32 @@ class ThetaAgent:
         # See SLURM_INTEGRATION_PLAN.md Phase 2 for full flow.
         pass
 
+    def _apply_coolant_tref(self, inlet_temp_c: float, ts: float) -> None:
+        """Feed the live BMC coolant-inlet temp into T_ref for liquid-cooled GPUs.
+
+        For t_ref_strategy='coolant_inlet' hardware (DGX H100/B200), idle-window
+        locking is disabled because T_j_idle ≈ coolant temp (ΔT falls below the
+        noise floor, making idle R_θ invalid). The coolant inlet is therefore the
+        correct physical reference, and tracking it live each Redfish poll corrects
+        the systematic bias that would otherwise come from using the static
+        profile expected_ambient_c when actual coolant differs from spec.
+
+        Air-cooled GPUs are deliberately left to their idle-window baseline: their
+        virtual-ambient reference is the idle *junction* temp, not raw inlet air,
+        so overwriting it here would bias R_θ the other way.
+        """
+        from .hw_profiles import resolve_profile
+        names = getattr(self, "_collector_gpu_names", {}) or {}
+        for gpu_idx, name in names.items():
+            if not name:
+                continue
+            prof = resolve_profile(name)
+            if prof is not None and getattr(prof, "t_ref_strategy", "idle_window") == "coolant_inlet":
+                self._baseline.set_external_ambient(
+                    gpu_idx, inlet_temp_c,
+                    source="coolant_inlet_bmc", uncertainty_c=1.0, ts=ts,
+                )
+
     def _reload_config(self) -> None:
         """Re-read ~/.theta/config.json and apply hot-reloadable fields.
 
@@ -1475,6 +1501,13 @@ class ThetaAgent:
                                 fan_rpm_min= fan_min,
                                 psu_watts  = chassis.psu_input_w,
                             )
+                            # Wire the live BMC coolant-inlet temp into T_ref for
+                            # liquid-cooled GPUs. Without this, those GPUs fall back to
+                            # the static profile expected_ambient_c, so real coolant
+                            # drift (e.g. 20 °C spec vs 25 °C actual) silently biases
+                            # every R_θ on the node. See _apply_coolant_tref.
+                            if chassis.inlet_temp_c is not None:
+                                self._apply_coolant_tref(chassis.inlet_temp_c, raw_sample.timestamp)
                             # Cross-layer correlation: is R_theta drift caused by cooling?
                             for g, rec in self._statemachine.all_states().items():
                                 if rec.current_state in (GPUState.DRIFTING, GPUState.CRITICAL):
